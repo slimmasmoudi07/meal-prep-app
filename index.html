@@ -1,0 +1,2436 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="theme-color" content="#2D6A4F"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="apple-mobile-web-app-title" content="Meal Prep"/>
+  <link rel="manifest" href="manifest.json"/>
+  <title>Meal Prep</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #F4F2EE; }
+    #root { height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+
+// ── RECIPE TAGS ───────────────────────────────────────────────────
+const RECIPE_TAGS = {
+  type: ["soupe","salade","pâtes","riz & bowl","viande","poisson","burger","sandwich","collation"],
+  cuisine: ["tunisien","asiatique","méditerranéen","américain","indien"],
+  carac: ["rapide","batch","congélable"]
+};
+const ALL_TAGS = [...RECIPE_TAGS.type,...RECIPE_TAGS.cuisine,...RECIPE_TAGS.carac];
+
+// Filter category definitions (for accordion UI)
+const FILTER_CATS = [
+  { key:"type",    label:"Type de plat",    tags: RECIPE_TAGS.type },
+  { key:"cuisine", label:"Cuisine",         tags: RECIPE_TAGS.cuisine },
+  { key:"carac",   label:"Caractéristiques",tags: RECIPE_TAGS.carac },
+  { key:"repas",   label:"Type de repas",   tags: ["déjeuner","dîner","les deux","work-friendly"] },
+];
+const TAG_COLORS = {
+  type:   {bg:"#EEF2FF",c:"#4338CA"},
+  cuisine:{bg:"#FFF7ED",c:"#C2410C"},
+  carac:  {bg:"#F0FDF4",c:"#166534"}
+};
+function tagFamily(tag){ if(RECIPE_TAGS.type.includes(tag)) return "type"; if(RECIPE_TAGS.cuisine.includes(tag)) return "cuisine"; return "carac"; }
+function TagChip({tag,small}){ const fam=tagFamily(tag); const col=TAG_COLORS[fam]; return <span style={{display:"inline-flex",padding:small?"1px 7px":"3px 9px",borderRadius:20,fontSize:small?10:11,fontWeight:600,background:col.bg,color:col.c,whiteSpace:"nowrap"}}>{tag}</span>; }
+
+// ── MACRO CALCULATOR (Anthropic API) ─────────────────────────────
+async function calculateMacrosViaAI(recipeName, variants, defaultPortions) {
+  const lines = [];
+  lines.push("Calculate nutritional macros PER SERVING for: " + recipeName + " (serves " + defaultPortions + ").");
+  lines.push('Reply ONLY with JSON, no markdown: {"variants":{"<name>":{"base":{"calories":0,"protein":0,"carbs":0,"fat":0},"optionals":[{"name":"","calories":0,"protein":0,"carbs":0,"fat":0}]}}}');
+  lines.push("Include oil/butter. All integers per serving.");
+  lines.push("VARIANTS:");
+  for (const v of variants) {
+    const nm = v.name || "default";
+    const mainIngs = v.ingredients.filter(i=>!i.optional&&i.name.trim()).map(i=>i.quantity+" "+i.unit+" "+i.name).join(", ");
+    const optIngs  = v.ingredients.filter(i=>i.optional&&i.name.trim()).map(i=>i.quantity+" "+i.unit+" "+i.name).join(", ");
+    lines.push(nm + " (main): " + mainIngs);
+    if (optIngs) lines.push(nm + " (optionals): " + optIngs);
+  }
+  const prompt = lines.join("\n");
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1000, messages:[{role:"user",content:prompt}] })
+    });
+    const data = await resp.json();
+    const text = (data.content||[]).find(b=>b.type==="text")?.text||"";
+    const clean = text.replace(/```json|```/g,"").trim();
+    return JSON.parse(clean);
+  } catch(e) {
+    console.error("Macro calc error:", e);
+    return null;
+  }
+}
+
+
+// ── STORAGE ──────────────────────────────────────────────────────
+// In-memory cache ensures state survives tab switches in same session.
+// Persistence: window.storage (Claude Artifacts) → localStorage fallback.
+// Circuit breaker: if window.storage fails once, disable it for the session
+// (avoids the broken Android WebView case where the API exists but throws).
+
+const _memCache = {};
+let _winStorageBroken = false;
+
+const _hasWinStorage = () => {
+  if (_winStorageBroken) return false;
+  try { return typeof window !== "undefined" && window.storage && typeof window.storage.get === "function"; }
+  catch { return false; }
+};
+const _hasLocalStorage = () => {
+  try { localStorage.setItem("_t","1"); localStorage.removeItem("_t"); return true; }
+  catch { return false; }
+};
+
+const Store = {
+  async load(k) {
+    // 1. In-memory cache first (always works, survives tab switches)
+    if (_memCache[k] !== undefined) return _memCache[k];
+    // 2. Try window.storage
+    if (_hasWinStorage()) {
+      try {
+        const r = await window.storage.get(k);
+        if (r) { const v = JSON.parse(r.value); _memCache[k] = v; return v; }
+      } catch(e) {
+        console.warn("window.storage.get failed, disabling for session:", e.message||e);
+        _winStorageBroken = true;
+      }
+    }
+    // 3. Try localStorage
+    if (_hasLocalStorage()) {
+      try {
+        const v = localStorage.getItem("mpa_" + k);
+        if (v) { const parsed = JSON.parse(v); _memCache[k] = parsed; return parsed; }
+      } catch {}
+    }
+    return null;
+  },
+  async save(k, v) {
+    // Always update in-memory cache first
+    _memCache[k] = v;
+    // Try window.storage, but trip circuit breaker on failure
+    if (_hasWinStorage()) {
+      try {
+        await window.storage.set(k, JSON.stringify(v));
+        // Also mirror to localStorage as belt-and-suspenders for cross-device backup
+        if (_hasLocalStorage()) {
+          try { localStorage.setItem("mpa_" + k, JSON.stringify(v)); } catch {}
+        }
+        return;
+      } catch(e) {
+        console.warn("window.storage.set failed, disabling for session:", e.message||e);
+        _winStorageBroken = true;
+      }
+    }
+    // Fallback: localStorage
+    if (_hasLocalStorage()) {
+      try { localStorage.setItem("mpa_" + k, JSON.stringify(v)); } catch {}
+    }
+  },
+  async clear(k) {
+    delete _memCache[k];
+    if (_hasWinStorage()) {
+      try { await window.storage.delete(k); }
+      catch(e) { _winStorageBroken = true; }
+    }
+    if (_hasLocalStorage()) {
+      try { localStorage.removeItem("mpa_" + k); } catch {}
+    }
+  }
+};
+
+// ── IDs ───────────────────────────────────────────────────────────
+const uid = () => "r-" + Date.now() + "-" + Math.random().toString(36).slice(2,6);
+const vid = () => "v-" + Date.now() + "-" + Math.random().toString(36).slice(2,6);
+const iid = () => "i-" + Math.random().toString(36).slice(2,8);
+const cid = () => "c-" + Date.now() + "-" + Math.random().toString(36).slice(2,5);
+
+// ── MIGRATION ─────────────────────────────────────────────────────
+function migrateRecipe(r) {
+  const withCategory = r.category ? r : {...r, category:"mine"};
+  const withLabels = withCategory.tags?.labels ? withCategory : {...withCategory, tags:{...withCategory.tags,labels:[]}};
+  if (!withLabels.variants) {
+    const variantId = vid();
+    return {
+      ...withLabels,
+      defaultVariantId: variantId,
+      variants: [{
+        id: variantId, name: "",
+        ingredients: (r.ingredients||[]).map(i => ({...i, optional: false})),
+        steps: r.steps||[], notes: r.notes||"",
+        macros:{calories:0,protein:0,carbs:0,fat:0}
+      }]
+    };
+  }
+  // Add macros to variants that don't have them
+  return {
+    ...withLabels,
+    variants: withLabels.variants.map(v => v.macros ? v : {...v, macros:{calories:0,protein:0,carbs:0,fat:0},optionalMacros:v.optionalMacros||[]})
+  };
+}
+
+// ── SEED ──────────────────────────────────────────────────────────
+
+function makeSeed() {
+  const ids = {};
+  const v = (k) => { if(!ids[k]) ids[k]="v-"+Date.now()+"-"+k; return ids[k]; };
+  const r = (k) => "r-"+Date.now()+"-"+k;
+  const now = Date.now();
+
+  return [
+    // ═══ MES RECETTES ═══
+    {
+      id:"r-001", name:"Salade de riz", defaultPortions:4, defaultVariantId:"sv1", category:"mine",
+      tags:{mealType:"lunch",workFriendly:true,labels:["salade", "riz & bowl", "tunisien", "batch"]},
+      storage:{fridgeDays:3,freezerSafe:false,freezerMonths:0,perishableNotes:"Légumes ramollissent après 2 jours"},
+      lastCooked:null, createdAt:now-200,
+      variants:[{id:"sv1",name:"",
+        optionalMacros:[{name:"Carottes",calories:10,protein:0,carbs:2,fat:0}],
+        ingredients:[
+          {id:"i1",name:"Riz",quantity:200,unit:"g",optional:false},
+          {id:"i2",name:"Tomates",quantity:2,unit:"pièces",optional:false},
+          {id:"i3",name:"Concombre",quantity:1,unit:"pièce",optional:false},
+          {id:"i4",name:"Poivron",quantity:1,unit:"pièce",optional:false},
+          {id:"i5",name:"Oignon",quantity:0.5,unit:"pièce",optional:false},
+          {id:"i6",name:"Thon en boîte",quantity:2,unit:"boîtes",optional:false},
+          {id:"i7",name:"Olives",quantity:50,unit:"g",optional:false},
+          {id:"i8",name:"Carottes",quantity:1,unit:"pièce",optional:true},
+          {id:"i9",name:"Huile du thon",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i10",name:"Citron",quantity:0.5,unit:"pièce",optional:false},
+          {id:"i11",name:"Menthe séchée",quantity:1,unit:"c. à café",optional:false}
+        ],
+        steps:["Cuire le riz et laisser refroidir complètement.","Couper tous les légumes en très petits dés.","Égoutter le thon en récupérant l'huile.","Mélanger riz, légumes, thon et olives.","Assaisonner: huile du thon, citron, menthe séchée, sel et poivre."],
+        notes:"Couper les légumes très petits pour une meilleure texture. Se déguste froid.",
+        macros:{calories:320,protein:22,carbs:48,fat:7}
+      }]
+    },
+    {
+      id:"r-002", name:"Spaghetti", defaultPortions:4, defaultVariantId:"sv2", category:"mine",
+      tags:{mealType:"dinner",workFriendly:false,labels:["pâtes", "tunisien", "batch"]},
+      storage:{fridgeDays:3,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-199,
+      variants:[
+        {id:"sv2",name:"Au poulet",
+          ingredients:[
+            {id:"i1",name:"Cuisses de poulet",quantity:600,unit:"g",optional:false},
+            {id:"i2",name:"Spaghetti",quantity:320,unit:"g",optional:false},
+            {id:"i3",name:"Concentré de tomate",quantity:2,unit:"c. à soupe",optional:false},
+            {id:"i4",name:"Ail",quantity:4,unit:"gousses",optional:false},
+            {id:"i5",name:"Harissa",quantity:1,unit:"c. à café",optional:false},
+            {id:"i6",name:"Tabel",quantity:1,unit:"c. à café",optional:false},
+            {id:"i7",name:"Karouia",quantity:0.5,unit:"c. à café",optional:false},
+            {id:"i8",name:"Laurier",quantity:2,unit:"feuilles",optional:false},
+            {id:"i9",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false}
+          ],
+          steps:["Faire revenir l'ail dans l'huile d'olive.","Dorer le poulet sur toutes les faces.","Ajouter concentré de tomate, harissa, tabel, karouia et laurier.","Couvrir d'eau, assaisonner. Mijoter 25 min.","Cuire les spaghetti al dente. Mélanger avec la sauce."],
+          notes:"",
+          macros:{calories:680,protein:45,carbs:64,fat:22}
+        },
+        {id:"sv3",name:"À la viande hachée",
+          ingredients:[
+            {id:"i1",name:"Viande hachée",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Spaghetti",quantity:320,unit:"g",optional:false},
+            {id:"i3",name:"Concentré de tomate",quantity:3,unit:"c. à soupe",optional:false},
+            {id:"i4",name:"Ail",quantity:3,unit:"gousses",optional:false},
+            {id:"i5",name:"Harissa",quantity:1,unit:"c. à café",optional:false},
+            {id:"i6",name:"Paprika",quantity:1,unit:"c. à café",optional:false},
+            {id:"i7",name:"Laurier",quantity:2,unit:"feuilles",optional:false},
+            {id:"i8",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false}
+          ],
+          steps:["Faire revenir l'ail dans l'huile d'olive.","Faire dorer la viande hachée en l'émiettant.","Ajouter épices et concentré de tomate.","Couvrir d'eau. Mijoter 20 min.","Cuire les spaghetti al dente. Servir avec la sauce."],
+          notes:"Ajouter une pincée de cannelle pour plus de profondeur.",
+          macros:{calories:720,protein:42,carbs:66,fat:28}
+        }
+      ]
+    },
+    {
+      id:"r-003", name:"Burritos", defaultPortions:4, defaultVariantId:"sv4", category:"mine",
+      tags:{mealType:"dinner",workFriendly:false,labels:["sandwich", "américain"]},
+      storage:{fridgeDays:2,freezerSafe:false,freezerMonths:0,perishableNotes:"Consommer rapidement une fois assemblés"},
+      lastCooked:null, createdAt:now-198,
+      variants:[
+        {id:"sv4",name:"Viande hachée",
+          optionalMacros:[{name:"Cheddar râpé",calories:110,protein:7,carbs:0,fat:9},{name:"Mozzarella",calories:80,protein:6,carbs:1,fat:6}],
+          ingredients:[
+            {id:"i1",name:"Viande hachée",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Tortillas",quantity:4,unit:"pièces",optional:false},
+            {id:"i3",name:"Cheddar râpé",quantity:100,unit:"g",optional:true},
+            {id:"i4",name:"Mozzarella",quantity:100,unit:"g",optional:true},
+            {id:"i5",name:"Yaourt grec",quantity:150,unit:"g",optional:false},
+            {id:"i6",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+            {id:"i7",name:"Maïs",quantity:100,unit:"g",optional:false},
+            {id:"i8",name:"Poivron",quantity:1,unit:"pièce",optional:false},
+            {id:"i9",name:"Harissa",quantity:1,unit:"c. à café",optional:false},
+            {id:"i10",name:"Paprika",quantity:1,unit:"c. à café",optional:false},
+            {id:"i11",name:"Huile d'olive",quantity:1,unit:"c. à soupe",optional:false}
+          ],
+          steps:["Assaisonner et faire revenir la viande (sel, poivre, paprika, harissa).","Sauter oignon, maïs et poivron séparément.","Sauce yaourt: mélanger yaourt, citron, paprika, sel, poivre, poudre d'ail.","Réchauffer les tortillas. Assembler: viande, légumes, fromage, sauce.","Rouler fermement en repliant les bords."],
+          notes:"Le fromage est optionnel. Réchauffer au four 5 min pour effet gratiné.",
+          macros:{calories:750,protein:38,carbs:52,fat:40}
+        },
+        {id:"sv5",name:"Au poulet",
+          optionalMacros:[{name:"Cheddar râpé",calories:110,protein:7,carbs:0,fat:9}],
+          ingredients:[
+            {id:"i1",name:"Blanc de poulet",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Tortillas",quantity:4,unit:"pièces",optional:false},
+            {id:"i3",name:"Cheddar râpé",quantity:100,unit:"g",optional:true},
+            {id:"i4",name:"Yaourt grec",quantity:150,unit:"g",optional:false},
+            {id:"i5",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+            {id:"i6",name:"Maïs",quantity:100,unit:"g",optional:false},
+            {id:"i7",name:"Poivron",quantity:1,unit:"pièce",optional:false},
+            {id:"i8",name:"Paprika",quantity:1,unit:"c. à café",optional:false},
+            {id:"i9",name:"Cumin",quantity:0.5,unit:"c. à café",optional:false},
+            {id:"i10",name:"Huile d'olive",quantity:1,unit:"c. à soupe",optional:false}
+          ],
+          steps:["Mariner le poulet: paprika, cumin, sel, poivre, citron. 15 min.","Griller et couper en lanières.","Sauter les légumes à feu vif.","Préparer la sauce yaourt (citron, épices).","Assembler et rouler les burritos."],
+          notes:"Ajouter de l'avocat pour plus d'onctuosité.",
+          macros:{calories:680,protein:42,carbs:50,fat:28}
+        }
+      ]
+    },
+    {
+      id:"r-004", name:"Pâtes sauce blanche poulet champignon", defaultPortions:4, defaultVariantId:"sv6", category:"mine",
+      tags:{mealType:"dinner",workFriendly:false,labels:["pâtes"]},
+      storage:{fridgeDays:2,freezerSafe:false,freezerMonths:0,perishableNotes:"La crème se conserve mal — consommer dans les 2 jours"},
+      lastCooked:null, createdAt:now-197,
+      variants:[{id:"sv6",name:"",
+        ingredients:[
+          {id:"i1",name:"Pâtes (penne ou fusilli)",quantity:320,unit:"g",optional:false},
+          {id:"i2",name:"Escalope de poulet",quantity:500,unit:"g",optional:false},
+          {id:"i3",name:"Champignons",quantity:300,unit:"g",optional:false},
+          {id:"i4",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+          {id:"i5",name:"Ail",quantity:3,unit:"gousses",optional:false},
+          {id:"i6",name:"Crème fraîche épaisse",quantity:400,unit:"ml",optional:false},
+          {id:"i7",name:"Mozzarella râpée",quantity:120,unit:"g",optional:false},
+          {id:"i8",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i9",name:"Basilic séché",quantity:1,unit:"c. à café",optional:false},
+          {id:"i10",name:"Romarin",quantity:0.5,unit:"c. à café",optional:false}
+        ],
+        steps:[
+          "Cuire les pâtes al dente selon le paquet. Égoutter en réservant un verre d'eau de cuisson.",
+          "Chauffer l'huile dans une grande poêle. Faire revenir l'oignon émincé 3 min à feu moyen.",
+          "Ajouter l'ail haché et les champignons tranchés. Cuire 5-6 min jusqu'à évaporation de l'eau.",
+          "Ajouter le poulet coupé en cubes. Dorer sur toutes les faces. Assaisonner sel, poivre, basilic, romarin.",
+          "Baisser le feu. Verser la crème fraîche. Mélanger et laisser réduire 3 min.",
+          "Incorporer la mozzarella, remuer jusqu'à fonte. Ajouter les pâtes et un peu d'eau de cuisson si trop épais."
+        ],
+        notes:"Ne pas rechauffer à feu trop vif pour ne pas trancher la crème. Ajouter parmesan râpé pour finir.",
+        macros:{calories:820,protein:48,carbs:62,fat:42}
+      }]
+    },
+    {
+      id:"r-005", name:"Potage de lentilles", defaultPortions:3, defaultVariantId:"sv7", category:"mine",
+      tags:{mealType:"lunch",workFriendly:true,labels:["soupe", "tunisien", "batch"]},
+      storage:{fridgeDays:4,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-196,
+      variants:[{id:"sv7",name:"",
+        ingredients:[
+          {id:"i1",name:"Lentilles en boîte",quantity:1,unit:"boîte (400g)",optional:false},
+          {id:"i2",name:"Pommes de terre",quantity:3,unit:"moyennes",optional:false},
+          {id:"i3",name:"Champignons",quantity:200,unit:"g",optional:false},
+          {id:"i4",name:"Oignon",quantity:1,unit:"grand",optional:false},
+          {id:"i5",name:"Ail",quantity:2,unit:"gousses",optional:false},
+          {id:"i6",name:"Crème fraîche",quantity:150,unit:"ml",optional:false},
+          {id:"i7",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i8",name:"Cumin",quantity:1,unit:"c. à café",optional:false},
+          {id:"i9",name:"Curcuma",quantity:1,unit:"c. à café",optional:false}
+        ],
+        steps:[
+          "Chauffer l'huile dans une grande casserole à feu moyen.",
+          "Faire revenir l'oignon émincé 2 min. Ajouter les lentilles rincées, remuer 1-2 min.",
+          "Incorporer l'ail haché, les champignons, sel, poivre, cumin, curcuma. Cuire 3-4 min.",
+          "Ajouter les pommes de terre pelées et coupées en cubes.",
+          "Couvrir d'eau bouillante. Mijoter à couvert à feu doux 30 min.",
+          "Hors du feu, ajouter la crème fraîche. Mixer jusqu'à consistance lisse et crémeuse.",
+          "Rectifier l'assaisonnement. Servir chaud avec un filet d'huile d'olive."
+        ],
+        notes:"Vérifier si les lentilles en boîte sont déjà cuites (oui en général). Texture plus épaisse si on mixe moins.",
+        macros:{calories:380,protein:16,carbs:54,fat:14}
+      }]
+    },
+    {
+      id:"r-006", name:"Potager (soupe de légumes)", defaultPortions:4, defaultVariantId:"sv8", category:"mine",
+      tags:{mealType:"both",workFriendly:true,labels:["soupe", "tunisien", "batch"]},
+      storage:{fridgeDays:4,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-195,
+      variants:[{id:"sv8",name:"",
+        ingredients:[
+          {id:"i1",name:"Pommes de terre",quantity:3,unit:"moyennes",optional:false},
+          {id:"i2",name:"Carottes",quantity:3,unit:"pièces",optional:false},
+          {id:"i3",name:"Courgettes",quantity:2,unit:"pièces",optional:false},
+          {id:"i4",name:"Brocoli",quantity:200,unit:"g",optional:false},
+          {id:"i5",name:"Asperges",quantity:200,unit:"g",optional:false},
+          {id:"i6",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+          {id:"i7",name:"Ail",quantity:2,unit:"gousses",optional:false},
+          {id:"i8",name:"Gingembre frais",quantity:2,unit:"cm",optional:false},
+          {id:"i9",name:"Crème fraîche",quantity:200,unit:"ml",optional:false},
+          {id:"i10",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i11",name:"Sauce soja",quantity:1,unit:"c. à soupe",optional:false},
+          {id:"i12",name:"Curcuma",quantity:1,unit:"c. à café",optional:false},
+          {id:"i13",name:"Tabel",quantity:0.5,unit:"c. à café",optional:false},
+          {id:"i14",name:"Karouia",quantity:0.5,unit:"c. à café",optional:false},
+          {id:"i15",name:"Zaatar",quantity:1,unit:"c. à café",optional:false},
+          {id:"i16",name:"Herbes de Provence",quantity:1,unit:"c. à café",optional:false},
+          {id:"i17",name:"Citron",quantity:1,unit:"pièce",optional:false},
+          {id:"i18",name:"Menthe séchée",quantity:1,unit:"c. à café",optional:false},
+          {id:"i19",name:"Paprika",quantity:1,unit:"c. à café",optional:false},
+          {id:"i20",name:"Piment fort (felfel mhachech)",quantity:0.5,unit:"c. à café",optional:true}
+        ],
+        steps:[
+          "Éplucher et couper tous les légumes grossièrement. Mettre dans une grande casserole avec l'eau.",
+          "Porter à ébullition. Cuire 20-25 min jusqu'à ce que tous les légumes soient tendres.",
+          "Retirer les légumes à l'aide d'une écumoire en conservant le bouillon.",
+          "Mixer les légumes avec l'ail, le gingembre et une louche de bouillon jusqu'à consistance lisse.",
+          "Remettre dans la casserole avec le bouillon. Ajouter crème fraîche, sauce soja, curcuma, tabel, karouia, zaatar.",
+          "Mijoter 5 min. Rectifier l'assaisonnement.",
+          "Servir avec jus de citron, menthe séchée, paprika et piment (dans l'assiette)."
+        ],
+        notes:"Khlil = bouillon en cube tunisien, excellent pour enrichir le goût. Ajuster la consistance avec le bouillon.",
+        macros:{calories:280,protein:7,carbs:34,fat:14}
+      }]
+    },
+    {
+      id:"r-007", name:"Tajine poulet au four", defaultPortions:4, defaultVariantId:"sv9", category:"mine",
+      tags:{mealType:"dinner",workFriendly:false,labels:["collation", "tunisien"]},
+      storage:{fridgeDays:3,freezerSafe:false,freezerMonths:0,perishableNotes:"Les œufs ne supportent pas la congélation"},
+      lastCooked:null, createdAt:now-194,
+      variants:[{id:"sv9",name:"",
+        ingredients:[
+          {id:"i1",name:"Poitrines de poulet",quantity:600,unit:"g",optional:false},
+          {id:"i2",name:"Œufs",quantity:4,unit:"pièces",optional:false},
+          {id:"i3",name:"Fromage râpé mélangé",quantity:150,unit:"g",optional:false},
+          {id:"i4",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+          {id:"i5",name:"Ail",quantity:3,unit:"gousses",optional:false},
+          {id:"i6",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i7",name:"Beurre",quantity:1,unit:"c. à soupe",optional:false},
+          {id:"i8",name:"Curcuma",quantity:1,unit:"c. à café",optional:false},
+          {id:"i9",name:"Eau",quantity:100,unit:"ml",optional:false}
+        ],
+        steps:[
+          "Cuire le poulet à feu doux dans l'huile avec l'ail, l'oignon émincé, sel, poivre et curcuma (15-20 min).",
+          "Quand le poulet est presque cuit, ajouter 100ml d'eau. Laisser le jus se former.",
+          "Retirer le poulet et couper en petits morceaux. Conserver le jus de cuisson.",
+          "Faire cuire 2 œufs durs (10 min). Refroidir et écraser grossièrement.",
+          "Beurrer un plat pyrex. Mélanger: poulet, jus de cuisson, œufs durs, oignon cru émincé, moitié du fromage.",
+          "Battre les 2 œufs crus et verser sur le mélange. Couvrir du reste du fromage.",
+          "Enfourner à 180°C pendant 25-30 min jusqu'à dorure et prise complète."
+        ],
+        notes:"Plat familial tunisien. Vérifier la cuisson en insérant un couteau au centre — doit ressortir propre.",
+        macros:{calories:390,protein:44,carbs:3,fat:22}
+      }]
+    },
+    {
+      id:"r-008", name:"Burger maison", defaultPortions:4, defaultVariantId:"sv10", category:"mine",
+      tags:{mealType:"dinner",workFriendly:false,labels:["burger", "américain"]},
+      storage:{fridgeDays:2,freezerSafe:false,freezerMonths:0,perishableNotes:"Le pain rassit rapidement — assembler au dernier moment"},
+      lastCooked:null, createdAt:now-193,
+      variants:[
+        {id:"sv10",name:"Classic cheddar",
+          ingredients:[
+            {id:"i1",name:"Viande hachée",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Pains burger",quantity:4,unit:"pièces",optional:false},
+            {id:"i3",name:"Cheddar en tranches",quantity:4,unit:"tranches",optional:false},
+            {id:"i4",name:"Tomates",quantity:2,unit:"pièces",optional:false},
+            {id:"i5",name:"Laitue",quantity:4,unit:"feuilles",optional:false},
+            {id:"i6",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+            {id:"i7",name:"Chapelure",quantity:2,unit:"c. à soupe",optional:false},
+            {id:"i8",name:"Huile de cuisson",quantity:1,unit:"c. à soupe",optional:false}
+          ],
+          steps:[
+            "Mélanger la viande avec chapelure, sel et poivre. Diviser en 4 steaks de taille égale.",
+            "Cuire à la poêle huilée à feu vif, 3-4 min de chaque côté selon épaisseur.",
+            "Poser une tranche de cheddar 1 min avant la fin. Couvrir pour fondre.",
+            "Toaster les pains. Assembler: pain, laitue, steak+fromage, tomate, oignon. Sauce au choix."
+          ],
+          notes:"Ne pas écraser le steak pendant la cuisson pour conserver le jus. Repos 2 min avant assemblage.",
+          macros:{calories:680,protein:38,carbs:48,fat:38}
+        },
+        {id:"sv11",name:"Brie & champignons",
+          ingredients:[
+            {id:"i1",name:"Viande hachée",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Pains burger",quantity:4,unit:"pièces",optional:false},
+            {id:"i3",name:"Brie",quantity:120,unit:"g",optional:false},
+            {id:"i4",name:"Champignons",quantity:200,unit:"g",optional:false},
+            {id:"i5",name:"Roquette",quantity:60,unit:"g",optional:false},
+            {id:"i6",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+            {id:"i7",name:"Chapelure",quantity:2,unit:"c. à soupe",optional:false},
+            {id:"i8",name:"Beurre",quantity:1,unit:"c. à soupe",optional:false},
+            {id:"i9",name:"Huile de cuisson",quantity:1,unit:"c. à soupe",optional:false}
+          ],
+          steps:[
+            "Faire revenir champignons tranchés et oignon dans le beurre jusqu'à caramélisation. Saler.",
+            "Former et assaisonner les steaks. Cuire 3-4 min/côté.",
+            "Déposer les tranches de brie 1 min avant la fin. Couvrir pour fondre.",
+            "Toaster les pains. Assembler: pain, roquette, steak+brie, champignons-oignon."
+          ],
+          notes:"Le brie apporte une onctuosité incomparable. Choisir un brie à température ambiante pour mieux fondre.",
+          macros:{calories:720,protein:37,carbs:46,fat:42}
+        }
+      ]
+    },
+    {
+      id:"r-009", name:"Market Loubia", defaultPortions:4, defaultVariantId:"sv12", category:"mine",
+      tags:{mealType:"dinner",workFriendly:false,labels:["viande", "tunisien", "batch"]},
+      storage:{fridgeDays:4,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-192,
+      variants:[{id:"sv12",name:"",
+        ingredients:[
+          {id:"i1",name:"Viande hachée",quantity:500,unit:"g",optional:false},
+          {id:"i2",name:"Haricots blancs cuits (loubia)",quantity:400,unit:"g",optional:false},
+          {id:"i3",name:"Oignon",quantity:1.5,unit:"pièces",optional:false},
+          {id:"i4",name:"Ail",quantity:4,unit:"gousses",optional:false},
+          {id:"i5",name:"Pâte de tomate",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i6",name:"Harissa",quantity:1,unit:"c. à café",optional:false},
+          {id:"i7",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i8",name:"Menthe séchée",quantity:1,unit:"c. à café",optional:false},
+          {id:"i9",name:"Origan",quantity:0.5,unit:"c. à café",optional:false},
+          {id:"i10",name:"Piment rouge en poudre",quantity:0.5,unit:"c. à café",optional:false},
+          {id:"i11",name:"Tabel et karouia",quantity:0.5,unit:"c. à café",optional:false},
+          {id:"i12",name:"Curcuma",quantity:0.25,unit:"c. à café",optional:false},
+          {id:"i13",name:"Piment fort frais",quantity:1,unit:"pièce",optional:true}
+        ],
+        steps:[
+          "Boulettes: mélanger viande, sel, poivre, piment, tabel, karouia, curcuma, menthe, origan, 1 gousse d'ail. Former en petites boulettes.",
+          "Faire revenir oignon et ail dans l'huile jusqu'à dorure dorée.",
+          "Ajouter les boulettes et saisir légèrement sur toutes les faces.",
+          "Incorporer pâte de tomate et harissa. Cuire 3-5 min à feu doux en mélangeant.",
+          "Ajouter l'eau progressivement puis couvrir largement d'eau (plus que pour des pâtes). Assaisonner.",
+          "Mijoter 20 min. Ajouter les haricots 10 min avant la fin.",
+          "Finir avec piment fort selon goût. Servir chaud."
+        ],
+        notes:"Plat traditionnel tunisien. Les boulettes petites cuisent mieux. Servir avec pain pour saucer.",
+        macros:{calories:480,protein:30,carbs:22,fat:28}
+      }]
+    },
+
+    // ═══ RECETTES SUGGÉRÉES ═══
+    {
+      id:"r-010", name:"Chicken Burrito Bowl", defaultPortions:4, defaultVariantId:"sv13", category:"suggested",
+      tags:{mealType:"both",workFriendly:true,labels:["riz & bowl", "américain", "batch"]},
+      storage:{fridgeDays:3,freezerSafe:false,freezerMonths:0,perishableNotes:"Préparer l'avocat au moment de servir"},
+      lastCooked:null, createdAt:now-191,
+      variants:[{id:"sv13",name:"",
+        ingredients:[
+          {id:"i1",name:"Blanc de poulet",quantity:500,unit:"g",optional:false},
+          {id:"i2",name:"Riz basmati",quantity:200,unit:"g",optional:false},
+          {id:"i3",name:"Haricots noirs",quantity:400,unit:"g",optional:false},
+          {id:"i4",name:"Maïs en boîte",quantity:200,unit:"g",optional:false},
+          {id:"i5",name:"Avocats",quantity:2,unit:"pièces",optional:false},
+          {id:"i6",name:"Tomates cerises",quantity:200,unit:"g",optional:false},
+          {id:"i7",name:"Yaourt grec",quantity:150,unit:"g",optional:false},
+          {id:"i8",name:"Citrons verts",quantity:2,unit:"pièces",optional:false},
+          {id:"i9",name:"Coriandre fraîche",quantity:1,unit:"bouquet",optional:false},
+          {id:"i10",name:"Ail",quantity:2,unit:"gousses",optional:false},
+          {id:"i11",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i12",name:"Cumin",quantity:1,unit:"c. à café",optional:false},
+          {id:"i13",name:"Paprika fumé",quantity:1,unit:"c. à café",optional:false}
+        ],
+        steps:[
+          "Mariner le poulet: huile, ail écrasé, cumin, paprika, sel, poivre, jus de citron vert. Minimum 30 min.",
+          "Cuire le riz. Rincer et égoutter haricots et maïs.",
+          "Préparer la sauce: yaourt grec, coriandre ciselée, jus de citron, sel.",
+          "Griller le poulet marinée 5-6 min de chaque côté à feu vif. Laisser reposer 5 min, trancher.",
+          "Assembler les bols: riz, haricots, maïs, poulet tranché, avocat en dés, tomates cerises.",
+          "Napper de sauce yaourt et garnir de coriandre et quartiers de citron vert."
+        ],
+        notes:"Garder les composants séparés pour mieux se conserver. Ajouter l'avocat uniquement au moment de servir.",
+        macros:{calories:520,protein:42,carbs:58,fat:14}
+      }]
+    },
+    {
+      id:"r-011", name:"Bowl bœuf coréen (Bulgogi)", defaultPortions:4, defaultVariantId:"sv14", category:"suggested",
+      tags:{mealType:"dinner",workFriendly:true,labels:["riz & bowl", "asiatique", "batch", "rapide"]},
+      storage:{fridgeDays:3,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-190,
+      variants:[{id:"sv14",name:"",
+        ingredients:[
+          {id:"i1",name:"Bœuf haché",quantity:500,unit:"g",optional:false},
+          {id:"i2",name:"Riz basmati",quantity:200,unit:"g",optional:false},
+          {id:"i3",name:"Brocoli",quantity:300,unit:"g",optional:false},
+          {id:"i4",name:"Carottes",quantity:2,unit:"pièces",optional:false},
+          {id:"i5",name:"Oignons verts",quantity:4,unit:"tiges",optional:false},
+          {id:"i6",name:"Ail",quantity:3,unit:"gousses",optional:false},
+          {id:"i7",name:"Gingembre frais",quantity:2,unit:"cm",optional:false},
+          {id:"i8",name:"Sauce soja",quantity:4,unit:"c. à soupe",optional:false},
+          {id:"i9",name:"Huile de sésame",quantity:1,unit:"c. à soupe",optional:false},
+          {id:"i10",name:"Miel",quantity:1,unit:"c. à soupe",optional:false},
+          {id:"i11",name:"Piment rouge",quantity:1,unit:"c. à café",optional:false},
+          {id:"i12",name:"Graines de sésame",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i13",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false}
+        ],
+        steps:[
+          "Préparer la sauce bulgogi: sauce soja, huile de sésame, miel, ail râpé, gingembre râpé, piment. Mélanger.",
+          "Cuire le riz. Blanchir le brocoli 3 min à l'eau bouillante. Julienner les carottes.",
+          "Faire revenir le bœuf haché dans l'huile à feu vif jusqu'à dorure. Émietter bien.",
+          "Verser la sauce sur le bœuf. Cuire 2-3 min en mélangeant jusqu'à caramélisation.",
+          "Assembler les bols: riz, bœuf coréen, brocoli, carottes.",
+          "Garnir d'oignons verts ciselés et graines de sésame. Filet d'huile de sésame."
+        ],
+        notes:"Saveur umami intense. Doubler la sauce pour avoir plus de caramélisation. Excellent chaud ou froid.",
+        macros:{calories:560,protein:32,carbs:48,fat:28}
+      }]
+    },
+    {
+      id:"r-012", name:"Saumon rôti + lentilles épinards", defaultPortions:4, defaultVariantId:"sv15", category:"suggested",
+      tags:{mealType:"dinner",workFriendly:false,labels:["poisson", "méditerranéen"]},
+      storage:{fridgeDays:2,freezerSafe:false,freezerMonths:0,perishableNotes:"Le saumon frais se conserve 2 jours max"},
+      lastCooked:null, createdAt:now-189,
+      variants:[{id:"sv15",name:"",
+        ingredients:[
+          {id:"i1",name:"Pavés de saumon",quantity:600,unit:"g",optional:false},
+          {id:"i2",name:"Lentilles vertes",quantity:250,unit:"g",optional:false},
+          {id:"i3",name:"Épinards frais",quantity:150,unit:"g",optional:false},
+          {id:"i4",name:"Tomates cerises",quantity:200,unit:"g",optional:false},
+          {id:"i5",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+          {id:"i6",name:"Ail",quantity:2,unit:"gousses",optional:false},
+          {id:"i7",name:"Citrons",quantity:2,unit:"pièces",optional:false},
+          {id:"i8",name:"Huile d'olive",quantity:3,unit:"c. à soupe",optional:false},
+          {id:"i9",name:"Moutarde de Dijon",quantity:1,unit:"c. à soupe",optional:false},
+          {id:"i10",name:"Miel",quantity:1,unit:"c. à café",optional:false},
+          {id:"i11",name:"Thym",quantity:1,unit:"c. à café",optional:false},
+          {id:"i12",name:"Laurier",quantity:2,unit:"feuilles",optional:false}
+        ],
+        steps:[
+          "Rincer et cuire les lentilles dans l'eau salée avec thym et laurier, 20-25 min. Égoutter.",
+          "Préchauffer le four à 200°C. Placer le saumon sur plaque recouverte de papier cuisson.",
+          "Mélanger: huile, moutarde, miel, jus d'un citron, sel, poivre. Badigeonner le saumon.",
+          "Enfourner 12-15 min selon épaisseur (saumon doit rester légèrement rosé au centre).",
+          "Faire revenir oignon et ail dans l'huile 3 min. Ajouter épinards, remuer jusqu'à réduction.",
+          "Mélanger lentilles, épinards, tomates cerises coupées. Servir avec saumon et quartiers de citron."
+        ],
+        notes:"Ne pas surcuire le saumon — rosé au centre est parfait. Les lentilles peuvent être préparées à l'avance.",
+        macros:{calories:580,protein:46,carbs:42,fat:22}
+      }]
+    },
+    {
+      id:"r-013", name:"Sheet Pan Poulet & Légumes", defaultPortions:4, defaultVariantId:"sv16", category:"suggested",
+      tags:{mealType:"dinner",workFriendly:true,labels:["viande", "rapide", "batch"]},
+      storage:{fridgeDays:4,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-188,
+      variants:[{id:"sv16",name:"",
+        ingredients:[
+          {id:"i1",name:"Hauts de cuisse de poulet (désossés)",quantity:800,unit:"g",optional:false},
+          {id:"i2",name:"Patates douces",quantity:2,unit:"pièces",optional:false},
+          {id:"i3",name:"Poivrons",quantity:2,unit:"pièces",optional:false},
+          {id:"i4",name:"Courgettes",quantity:2,unit:"pièces",optional:false},
+          {id:"i5",name:"Oignon rouge",quantity:1,unit:"pièce",optional:false},
+          {id:"i6",name:"Ail",quantity:4,unit:"gousses",optional:false},
+          {id:"i7",name:"Huile d'olive",quantity:4,unit:"c. à soupe",optional:false},
+          {id:"i8",name:"Paprika fumé",quantity:2,unit:"c. à café",optional:false},
+          {id:"i9",name:"Cumin",quantity:1,unit:"c. à café",optional:false},
+          {id:"i10",name:"Origan",quantity:1,unit:"c. à café",optional:false}
+        ],
+        steps:[
+          "Préchauffer le four à 210°C. Tapisser une grande plaque de papier cuisson.",
+          "Couper tous les légumes en gros morceaux. Éplucher les patates douces.",
+          "Dans un grand bol, mélanger huile, paprika, cumin, origan, sel, poivre. Enrober poulet et légumes.",
+          "Étaler en couche unique sur la plaque (ne pas superposer, utiliser 2 plaques si nécessaire).",
+          "Enfourner 35-40 min. Retourner à mi-cuisson. Le poulet doit être doré, les légumes caramélisés."
+        ],
+        notes:"Ultra simple — un seul plat à nettoyer. Varier les légumes selon saison. Excellent réchauffé.",
+        macros:{calories:440,protein:38,carbs:22,fat:22}
+      }]
+    },
+    {
+      id:"r-014", name:"Poulet Tikka Masala", defaultPortions:4, defaultVariantId:"sv17", category:"suggested",
+      tags:{mealType:"dinner",workFriendly:true,labels:["viande", "indien", "batch"]},
+      storage:{fridgeDays:3,freezerSafe:true,freezerMonths:2,perishableNotes:""},
+      lastCooked:null, createdAt:now-187,
+      variants:[{id:"sv17",name:"",
+        ingredients:[
+          {id:"i1",name:"Blanc de poulet",quantity:600,unit:"g",optional:false},
+          {id:"i2",name:"Riz basmati",quantity:200,unit:"g",optional:false},
+          {id:"i3",name:"Yaourt grec",quantity:200,unit:"g",optional:false},
+          {id:"i4",name:"Tomates concassées",quantity:400,unit:"g",optional:false},
+          {id:"i5",name:"Crème de coco",quantity:200,unit:"ml",optional:false},
+          {id:"i6",name:"Oignon",quantity:1,unit:"pièce",optional:false},
+          {id:"i7",name:"Ail",quantity:3,unit:"gousses",optional:false},
+          {id:"i8",name:"Gingembre frais",quantity:2,unit:"cm",optional:false},
+          {id:"i9",name:"Huile d'olive",quantity:2,unit:"c. à soupe",optional:false},
+          {id:"i10",name:"Garam masala",quantity:2,unit:"c. à café",optional:false},
+          {id:"i11",name:"Curcuma",quantity:1,unit:"c. à café",optional:false},
+          {id:"i12",name:"Paprika",quantity:1,unit:"c. à café",optional:false},
+          {id:"i13",name:"Cumin",quantity:1,unit:"c. à café",optional:false},
+          {id:"i14",name:"Coriandre fraîche",quantity:0.5,unit:"bouquet",optional:false}
+        ],
+        steps:[
+          "Mariner le poulet en cubes: yaourt, garam masala (moitié), curcuma, sel. Minimum 30 min (idéalement une nuit).",
+          "Faire revenir oignon, ail et gingembre râpé dans l'huile 4 min.",
+          "Ajouter le reste des épices. Cuire 1 min jusqu'à parfum.",
+          "Incorporer les tomates concassées. Mijoter 10 min à feu moyen.",
+          "Griller le poulet mariné à la poêle chaude 2-3 min/côté. L'ajouter à la sauce.",
+          "Verser la crème de coco. Mijoter 10 min. Servir sur riz avec coriandre fraîche."
+        ],
+        notes:"Plus la marinade est longue, plus le poulet est tendre. Sauce épaissit en refroidissant — ajouter un peu d'eau au réchauffage.",
+        macros:{calories:540,protein:42,carbs:48,fat:18}
+      }]
+    },
+
+    // ═══ RECETTES CHEF ═══
+    {
+      id:"r-015", name:"Buddha Bowl", defaultPortions:4, defaultVariantId:"sv18", category:"suggested",
+      tags:{mealType:"both",workFriendly:true,labels:["riz & bowl", "asiatique", "batch"]},
+      storage:{fridgeDays:2,freezerSafe:false,freezerMonths:0,perishableNotes:"Préparer l'avocat au moment de servir"},
+      lastCooked:null, createdAt:now-186,
+      variants:[
+        {id:"sv18",name:"Poulet Teriyaki",
+          ingredients:[
+            {id:"i1",name:"Blanc de poulet",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Riz sushi (ou basmati)",quantity:200,unit:"g",optional:false},
+            {id:"i3",name:"Edamame (surgelés)",quantity:200,unit:"g",optional:false},
+            {id:"i4",name:"Avocats",quantity:2,unit:"pièces",optional:false},
+            {id:"i5",name:"Concombre",quantity:1,unit:"pièce",optional:false},
+            {id:"i6",name:"Carottes",quantity:2,unit:"pièces",optional:false},
+            {id:"i7",name:"Graines de sésame",quantity:2,unit:"c. à soupe",optional:false},
+            {id:"i8",name:"Sauce teriyaki",quantity:4,unit:"c. à soupe",optional:false},
+            {id:"i9",name:"Sauce soja",quantity:2,unit:"c. à soupe",optional:false},
+            {id:"i10",name:"Miel",quantity:1,unit:"c. à soupe",optional:false},
+            {id:"i11",name:"Ail",quantity:2,unit:"gousses",optional:false},
+            {id:"i12",name:"Huile de sésame",quantity:1,unit:"c. à soupe",optional:false},
+            {id:"i13",name:"Huile d'olive",quantity:1,unit:"c. à soupe",optional:false},
+            {id:"i14",name:"Gingembre",quantity:1,unit:"c. à café",optional:false}
+          ],
+          steps:[
+            "Mariner le poulet: sauce soja, miel, ail râpé, gingembre. 20 min minimum.",
+            "Cuire le riz. Cuire les edamame selon paquet.",
+            "Julienner les carottes. Trancher le concombre finement. Couper l'avocat en lamelles.",
+            "Griller le poulet marinée 5-6 min/côté à feu vif. Badigeonner de teriyaki en fin de cuisson.",
+            "Trancher le poulet en biais. Assembler: riz au centre, poulet, avocat, edamame, carottes, concombre.",
+            "Finir avec sésame et filet d'huile de sésame. Reste de teriyaki en sauce."
+          ],
+          notes:"Le secret: tous les éléments dans le même bol mais séparés visuellement. Préparer l'avocat au dernier moment.",
+          macros:{calories:620,protein:44,carbs:68,fat:18}
+        },
+        {id:"sv19",name:"Saumon Citron Sésame",
+          ingredients:[
+            {id:"i1",name:"Pavés de saumon",quantity:600,unit:"g",optional:false},
+            {id:"i2",name:"Riz sushi (ou basmati)",quantity:200,unit:"g",optional:false},
+            {id:"i3",name:"Edamame (surgelés)",quantity:200,unit:"g",optional:false},
+            {id:"i4",name:"Avocats",quantity:2,unit:"pièces",optional:false},
+            {id:"i5",name:"Concombre",quantity:1,unit:"pièce",optional:false},
+            {id:"i6",name:"Radis",quantity:100,unit:"g",optional:false},
+            {id:"i7",name:"Graines de sésame",quantity:2,unit:"c. à soupe",optional:false},
+            {id:"i8",name:"Sauce soja",quantity:3,unit:"c. à soupe",optional:false},
+            {id:"i9",name:"Huile de sésame",quantity:1,unit:"c. à soupe",optional:false},
+            {id:"i10",name:"Citrons",quantity:2,unit:"pièces",optional:false},
+            {id:"i11",name:"Sriracha",quantity:1,unit:"c. à café",optional:false},
+            {id:"i12",name:"Miel",quantity:1,unit:"c. à café",optional:false},
+            {id:"i13",name:"Gingembre",quantity:1,unit:"c. à café",optional:false},
+            {id:"i14",name:"Huile d'olive",quantity:1,unit:"c. à soupe",optional:false}
+          ],
+          steps:[
+            "Mariner le saumon: sauce soja, jus de citron, miel, gingembre, sriracha. 15-20 min.",
+            "Cuire le riz. Cuire les edamame.",
+            "Trancher concombre et radis très finement (mandoline si possible).",
+            "Cuire le saumon marinée à feu moyen 4 min/côté. Ne pas surcuire.",
+            "Sauce bowl: reste de marinade + huile sésame + sriracha + jus citron.",
+            "Assembler: riz, saumon effiloché, avocat, edamame, concombre, radis. Sauce et sésame."
+          ],
+          notes:"Éffilocher le saumon chaud directement dans le bol pour qu'il s'imprègne de sauce. Goût japonisant.",
+          macros:{calories:580,protein:40,carbs:62,fat:20}
+        }
+      ]
+    },
+    {
+      id:"r-016", name:"Salade repas", defaultPortions:4, defaultVariantId:"sv20", category:"suggested",
+      tags:{mealType:"lunch",workFriendly:true,labels:["salade", "méditerranéen", "rapide"]},
+      storage:{fridgeDays:2,freezerSafe:false,freezerMonths:0,perishableNotes:"Garder la sauce séparée — mélanger au dernier moment"},
+      lastCooked:null, createdAt:now-185,
+      variants:[
+        {id:"sv20",name:"César au poulet grillé",
+          ingredients:[
+            {id:"i1",name:"Blanc de poulet",quantity:500,unit:"g",optional:false},
+            {id:"i2",name:"Laitue romaine",quantity:400,unit:"g",optional:false},
+            {id:"i3",name:"Parmesan râpé",quantity:80,unit:"g",optional:false},
+            {id:"i4",name:"Croûtons",quantity:100,unit:"g",optional:false},
+            {id:"i5",name:"Mayonnaise",quantity:3,unit:"c. à soupe",optional:false},
+            {id:"i6",name:"Anchois en boîte",quantity:4,unit:"filets",optional:false},
+            {id:"i7",name:"Ail",quantity:1,unit:"gousse",optional:false},
+            {id:"i8",name:"Citron",quantity:1,unit:"pièce",optional:false},
+            {id:"i9",name:"Sauce worcestershire",quantity:1,unit:"c. à café",optional:false},
+            {id:"i10",name:"Huile d'olive",quantity:1,unit:"c. à soupe",optional:false}
+          ],
+          steps:[
+            "Sauce César: mixer mayo, anchois, ail, parmesan (moitié), jus de citron, worcestershire, sel, poivre.",
+            "Assaisonner le poulet (sel, poivre, paprika). Griller 5-6 min/côté. Repos 5 min, trancher.",
+            "Faire dorer les croûtons à la poêle avec huile et sel jusqu'à coloration.",
+            "Laver et déchirer la romaine en gros morceaux.",
+            "Dans un grand bol: romaine + sauce César. Bien mélanger pour enrober.",
+            "Servir avec poulet tranché, parmesan restant et croûtons par-dessus."
+          ],
+          notes:"Garder les composants séparés pour meal prep. Sauce dure 4 jours au frigo. Croûtons dans un bocal.",
+          macros:{calories:520,protein:46,carbs:24,fat:28}
+        },
+        {id:"sv21",name:"Méditerranéenne au thon",
+          ingredients:[
+            {id:"i1",name:"Thon en boîte",quantity:280,unit:"g (égoutté)",optional:false},
+            {id:"i2",name:"Laitue mélangée",quantity:150,unit:"g",optional:false},
+            {id:"i3",name:"Tomates cerises",quantity:200,unit:"g",optional:false},
+            {id:"i4",name:"Concombre",quantity:1,unit:"pièce",optional:false},
+            {id:"i5",name:"Oignon rouge",quantity:0.5,unit:"pièce",optional:false},
+            {id:"i6",name:"Olives noires",quantity:80,unit:"g",optional:false},
+            {id:"i7",name:"Feta",quantity:150,unit:"g",optional:false},
+            {id:"i8",name:"Pois chiches",quantity:400,unit:"g",optional:false},
+            {id:"i9",name:"Poivron rouge",quantity:1,unit:"pièce",optional:false},
+            {id:"i10",name:"Huile d'olive",quantity:4,unit:"c. à soupe",optional:false},
+            {id:"i11",name:"Citrons",quantity:2,unit:"pièces",optional:false},
+            {id:"i12",name:"Origan séché",quantity:1,unit:"c. à café",optional:false},
+            {id:"i13",name:"Menthe fraîche",quantity:0.5,unit:"bouquet",optional:false}
+          ],
+          steps:[
+            "Égoutter le thon et les pois chiches. Rincer les pois chiches.",
+            "Couper tomates cerises en deux, concombre en demi-lunes, oignon et poivron en fines lamelles.",
+            "Vinaigrette: huile d'olive, jus des deux citrons, origan, sel, poivre. Émulsionner.",
+            "Dans un grand bol: salade, légumes, thon émietté, pois chiches, olives.",
+            "Émietter la feta par-dessus. Arroser de vinaigrette.",
+            "Garnir de menthe fraîche ciselée. Mélanger délicatement."
+          ],
+          notes:"Salade très nourrissante et équilibrée. Excellent le lendemain car les saveurs se développent. Garder la vinaigrette séparée.",
+          macros:{calories:480,protein:40,carbs:36,fat:22}
+        }
+      ]
+    }
+  ];
+}
+
+// ── DATE UTILS ────────────────────────────────────────────────────
+const DAY_FULL  = ["Dimanche","Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"];
+const MONTH_FR  = ["jan","fév","mar","avr","mai","jun","jul","aoû","sep","oct","nov","déc"];
+
+function getMonday(d) {
+  const dt = new Date(d); dt.setHours(0,0,0,0);
+  const day = dt.getDay();
+  dt.setDate(dt.getDate() + (day===0 ? -6 : 1-day));
+  return dt;
+}
+function addDays(d, n) { const dt = new Date(d); dt.setDate(dt.getDate()+n); return dt; }
+function toISO(d) { return d.toISOString().slice(0,10); }
+function fmtRange(mon) {
+  const sun = addDays(mon,6);
+  return mon.getDate()+" "+MONTH_FR[mon.getMonth()]+" – "+sun.getDate()+" "+MONTH_FR[sun.getMonth()];
+}
+function isToday(s) { return s===toISO(new Date()); }
+
+// ── PLAN UTILS ────────────────────────────────────────────────────
+function buildEmpty(mon) {
+  return {
+    weekStartDate: toISO(mon),
+    days: Array.from({length:7}, (_,i) => ({
+      date: toISO(addDays(mon,i)),
+      cooked:[], lunch:null, dinner:null, actions:[]
+    }))
+  };
+}
+
+function getVariant(recipe, variantId) {
+  if (!recipe || !recipe.variants) return null;
+  return recipe.variants.find(v => v.id===variantId) || recipe.variants[0];
+}
+
+function getDefaultVariant(recipe) {
+  if (!recipe || !recipe.variants) return null;
+  return recipe.variants.find(v => v.id===recipe.defaultVariantId) || recipe.variants[0];
+}
+
+function getAvailable(plan, dayIdx, recipes) {
+  const target = plan.days[dayIdx].date;
+  const result = [];
+  for (let i=0; i<=dayIdx; i++) {
+    for (const ck of (plan.days[i].cooked||[])) {
+      const recipe = recipes.find(r => r.id===ck.recipeId);
+      if (!recipe) continue;
+      const expiry = toISO(addDays(new Date(plan.days[i].date+"T12:00:00"), recipe.storage.fridgeDays));
+      if (target > expiry) continue;
+      const used = countUsed(plan, ck.id);
+      if (ck.portions - used <= 0) continue;
+      result.push({ cook:ck, recipe, remaining:ck.portions-used, cookDate:plan.days[i].date });
+    }
+  }
+  return result;
+}
+
+function countUsed(plan, cookId) {
+  let n=0;
+  for (const d of plan.days) {
+    if (d.lunch && d.lunch.cookId===cookId) n++;
+    if (d.dinner && d.dinner.cookId===cookId) n++;
+  }
+  return n;
+}
+
+function batchRemaining(plan, cookId) {
+  if (!cookId) return null;
+  let total=0;
+  for (const d of plan.days)
+    for (const ck of (d.cooked||[]))
+      if (ck.id===cookId) total=ck.portions;
+  return total - countUsed(plan, cookId);
+}
+
+function filledDays(plan) {
+  if (!plan) return 0;
+  return plan.days.filter(d => d.lunch||d.dinner).length;
+}
+
+// ── GROCERY UTILS ─────────────────────────────────────────────────
+const ESSENTIAL_KEYS = [
+  "sel","poivre","huile","beurre","sucre","farine","vinaigre","moutarde",
+  "harissa","paprika","cumin","curcuma","cannelle","origan","thym","romarin",
+  "basilic","persil","coriandre","menthe","laurier","piment","épice",
+  "tabel","karouia","ras el hanout","zaatar","curry","gingembre","muscade",
+  "concentré de tomate","sauce tomate","bouillon","levure","bicarbonate",
+  "poudre d'ail","ail en poudre","poudre de piment","sauce soja"
+];
+function isEssential(name) {
+  const n = name.toLowerCase().trim();
+  return ESSENTIAL_KEYS.some(k => n.includes(k));
+}
+function getCategory(name) {
+  const n = name.toLowerCase();
+  if (["poulet","viande","boeuf","porc","agneau","thon","saumon","poisson","crevette"].some(k=>n.includes(k))) return "Viandes & Poissons";
+  if (["lait","fromage","yaourt","crème","mozzarella","cheddar","feta"].some(k=>n.includes(k))) return "Produits laitiers";
+  if (["tomate","concombre","poivron","oignon","ail","courgette","carotte","salade","épinard","brocoli","maïs","champignon","pomme de terre"].some(k=>n.includes(k))) return "Légumes";
+  if (["pomme","banane","citron","orange","fraise","avocat","mangue"].some(k=>n.includes(k))) return "Fruits";
+  if (["riz","spaghetti","pâte","farine","pain","tortilla","quinoa","lentille"].some(k=>n.includes(k))) return "Féculents";
+  return "Autres";
+}
+
+// Aggregate all ingredients from all cooked batches in the plan
+function aggregateIngredients(plan, recipes, shoppedIds) {
+  const excluded = new Set(shoppedIds||[]);
+  const today = toISO(new Date());
+  const map = {};
+  for (const day of plan.days) {
+    if (day.date < today) continue; // skip past days
+    for (const ck of (day.cooked||[])) {
+      if (excluded.has(ck.id)) continue; // already shopped
+      const recipe = recipes.find(r => r.id===ck.recipeId);
+      if (!recipe) continue;
+      const variant = getVariant(recipe, ck.variantId) || getDefaultVariant(recipe);
+      if (!variant) continue;
+      const factor = ck.portions / recipe.defaultPortions;
+      const chosenOptIds = new Set(ck.optionals || []);
+      for (const ing of variant.ingredients) {
+        // Skip optional ingredients UNLESS the user picked this one for this cooking
+        if (ing.optional && !chosenOptIds.has(ing.id)) continue;
+        const key = ing.name.toLowerCase().trim();
+        if (!map[key]) map[key] = { name:ing.name, qty:0, unit:ing.unit, isEssential:isEssential(ing.name) };
+        map[key].qty += (parseFloat(ing.quantity)||0) * factor;
+      }
+    }
+  }
+  return Object.values(map).map(item => ({
+    ...item,
+    key: item.name.toLowerCase().trim(),
+    qty: parseFloat(item.qty.toFixed(2)),
+    category: isEssential(item.name) ? "Épices & essentiels" : getCategory(item.name)
+  }));
+}
+
+// ── MISC ──────────────────────────────────────────────────────────
+const fmtQ = n => { const r=parseFloat((+n).toFixed(2)); return r%1===0?String(r):String(r); };
+const EMPTY_VARIANT = () => ({ id:vid(), name:"", ingredients:[{id:iid(),name:"",quantity:"",unit:"",optional:false}], steps:[""], notes:"", macros:{calories:0,protein:0,carbs:0,fat:0} });
+const EMPTY_RECIPE = () => {
+  const v = EMPTY_VARIANT();
+  return { id:uid(), name:"", defaultPortions:4, defaultVariantId:v.id, category:"mine", tags:{mealType:"both",workFriendly:true,labels:[]}, storage:{fridgeDays:3,freezerSafe:false,freezerMonths:0,perishableNotes:""}, lastCooked:null, createdAt:Date.now(), variants:[v] };
+};
+
+// ── THEME ─────────────────────────────────────────────────────────
+const C = {
+  page:"#F4F2EE", card:"#FFFFFF", log:"#F9F7F4",
+  accent:"#2D6A4F", accentL:"#E8F4EE",
+  warn:"#B5541A", warnL:"#FDF0EB",
+  text:"#1A1A1A", sub:"#6B6460", muted:"#A09890", light:"#D0CCC8",
+  border:"#ECEAE6",
+  green:"#2D6A4F", greenL:"#E8F4EE",
+  blue:"#1D5FAA", blueL:"#E6EFF9",
+  amber:"#9B5E15", amberL:"#FDF3E3",
+  red:"#B53A2F", redL:"#FDECEA",
+};
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{background:${C.page};}
+.app{max-width:430px;margin:0 auto;min-height:100vh;font-family:'Plus Jakarta Sans',sans-serif;color:${C.text};}
+input,textarea{font-family:'Plus Jakarta Sans',sans-serif;font-size:14px;color:${C.text};background:${C.card};border:1.5px solid ${C.border};border-radius:8px;padding:9px 11px;width:100%;outline:none;}
+input:focus,textarea:focus{border-color:${C.accent};}
+textarea{resize:vertical;min-height:70px;line-height:1.5;}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:11px 18px;border-radius:10px;font-family:'Plus Jakarta Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:all .14s;}
+.btn:active{transform:scale(0.97);}
+.btn-primary{background:${C.accent};color:white;}
+.btn-ghost{background:transparent;color:${C.text};border:1.5px solid ${C.border};}
+.btn-danger{background:transparent;color:${C.red};border:1.5px solid ${C.red};}
+.chip{padding:6px 13px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;border:1.5px solid;transition:all .14s;white-space:nowrap;font-family:'Plus Jakarta Sans',sans-serif;}
+.chip-on{background:${C.accent};color:white;border-color:${C.accent};}
+.chip-off{background:transparent;color:${C.muted};border-color:${C.border};}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;display:flex;flex-direction:column;justify-content:flex-end;}
+.sheet{background:${C.card};border-radius:20px 20px 0 0;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;}
+::-webkit-scrollbar{width:0;}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.slide-up{animation:slideUp .24s cubic-bezier(.32,.72,0,1) both;}
+.fade-up{animation:fadeUp .18s ease both;}
+`;
+
+// ── SHARED COMPONENTS ─────────────────────────────────────────────
+function Stepper({ value, onChange, min=1, max=20 }) {
+  return (
+    <div style={{display:"flex",alignItems:"center",border:"1.5px solid "+C.border,borderRadius:9,overflow:"hidden",background:C.card}}>
+      <button onClick={()=>onChange(Math.max(min,value-1))} style={{width:36,height:36,background:"none",border:"none",fontSize:18,color:value<=min?C.light:C.accent,cursor:value<=min?"default":"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+      <span style={{padding:"0 6px",fontSize:14,fontWeight:600,minWidth:26,textAlign:"center"}}>{value}</span>
+      <button onClick={()=>onChange(Math.min(max,value+1))} style={{width:36,height:36,background:"none",border:"none",fontSize:18,color:value>=max?C.light:C.accent,cursor:value>=max?"default":"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+    </div>
+  );
+}
+function Toggle({ on, onToggle, colorOn }) {
+  return (
+    <div onClick={onToggle} style={{width:44,height:25,borderRadius:13,background:on?(colorOn||C.green):C.light,cursor:"pointer",position:"relative",transition:"background .18s",flexShrink:0}}>
+      <div style={{position:"absolute",top:3,left:on?22:3,width:19,height:19,borderRadius:"50%",background:"white",transition:"left .18s",boxShadow:"0 1px 3px rgba(0,0,0,.15)"}}/>
+    </div>
+  );
+}
+function MealTag({ mealType }) {
+  const map = {both:{l:"Déj+Dîner",bg:C.blueL,c:C.blue},lunch:{l:"Déjeuner",bg:C.blueL,c:C.blue},dinner:{l:"Dîner",bg:"#F1EDF9",c:"#5B3E9E"}};
+  const t = map[mealType]||map.both;
+  return <span style={{display:"inline-flex",padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:t.bg,color:t.c,whiteSpace:"nowrap"}}>{t.l}</span>;
+}
+function BottomNav({ active, onChange }) {
+  const tabs = [{id:"week",label:"Semaine",icon:"▦"},{id:"recipes",label:"Recettes",icon:"✦"},{id:"grocery",label:"Courses",icon:"◈"},{id:"ai",label:"IA",icon:"◎",disabled:true}];
+  return (
+    <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:C.card,borderTop:"1px solid "+C.border,display:"flex",zIndex:90,paddingBottom:2}}>
+      {tabs.map(t=>(
+        <button key={t.id} onClick={()=>!t.disabled&&onChange(t.id)} style={{flex:1,padding:"9px 0 7px",background:"none",border:"none",cursor:t.disabled?"default":"pointer",opacity:t.disabled?0.3:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+          <span style={{fontSize:16,color:active===t.id?C.accent:C.muted,fontWeight:active===t.id?700:400,lineHeight:1}}>{t.icon}</span>
+          <span style={{fontSize:10,fontWeight:active===t.id?700:500,color:active===t.id?C.accent:C.muted,fontFamily:"Plus Jakarta Sans",letterSpacing:.3}}>{t.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── ACTIONS LIST ──────────────────────────────────────────────────
+function ActionsList({ actions, onChange }) {
+  const [adding, setAdding] = useState(false);
+  const [txt, setTxt] = useState("");
+  const ref = useRef(null);
+  useEffect(()=>{ if(adding&&ref.current) ref.current.focus(); },[adding]);
+  const add = () => {
+    if (!txt.trim()) { setAdding(false); return; }
+    onChange([...actions, {id:"a-"+Date.now(),text:txt.trim(),checked:false}]);
+    setTxt(""); setAdding(false);
+  };
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:5}}>
+      {actions.map(a=>(
+        <div key={a.id} style={{display:"flex",alignItems:"flex-start",gap:5}}>
+          <button onClick={()=>onChange(actions.map(x=>x.id===a.id?{...x,checked:!x.checked}:x))}
+            style={{width:14,height:14,borderRadius:3,border:"1.5px solid "+(a.checked?C.green:C.light),background:a.checked?C.green:"transparent",flexShrink:0,marginTop:2,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>
+            {a.checked&&<span style={{color:"white",fontSize:8,lineHeight:1}}>✓</span>}
+          </button>
+          <span onClick={()=>onChange(actions.map(x=>x.id===a.id?{...x,checked:!x.checked}:x))} style={{fontSize:11,color:a.checked?C.muted:C.sub,textDecoration:a.checked?"line-through":"none",flex:1,lineHeight:1.35,cursor:"pointer"}}>{a.text}</span>
+          <button onClick={()=>onChange(actions.filter(x=>x.id!==a.id))} style={{background:"none",border:"none",color:C.light,fontSize:12,cursor:"pointer",lineHeight:1,padding:0,flexShrink:0}}>×</button>
+        </div>
+      ))}
+      {adding ? (
+        <div style={{display:"flex",gap:4}}>
+          <input ref={ref} value={txt} onChange={e=>setTxt(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")add();if(e.key==="Escape"){setAdding(false);setTxt("");}}} placeholder="Action…" style={{fontSize:11,padding:"4px 7px",borderRadius:6,flex:1,border:"1px solid "+C.border}}/>
+          <button onClick={add} style={{padding:"4px 8px",borderRadius:6,background:C.accent,color:"white",border:"none",fontSize:11,cursor:"pointer",fontFamily:"Plus Jakarta Sans",fontWeight:600}}>OK</button>
+        </div>
+      ) : (
+        <button onClick={()=>setAdding(true)} style={{background:"none",border:"none",color:C.accent,fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"Plus Jakarta Sans",textAlign:"left",padding:"1px 0"}}>+ Action</button>
+      )}
+    </div>
+  );
+}
+
+// ── CUISINE LIST ──────────────────────────────────────────────────
+function CuisineList({ cooked, recipes, onAdd, onRemove }) {
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:5}}>
+      {cooked.map(ck=>{
+        const r = recipes.find(x=>x.id===ck.recipeId);
+        const v = r ? getVariant(r, ck.variantId) : null;
+        const label = r ? (v&&v.name ? r.name+" · "+v.name : r.name) : "?";
+        return (
+          <div key={ck.id} style={{display:"flex",alignItems:"center",gap:5}}>
+            <div style={{width:5,height:5,borderRadius:"50%",background:C.accent,flexShrink:0}}/>
+            <span style={{fontSize:11,fontWeight:600,color:C.text,flex:1,lineHeight:1.3}}>{label}</span>
+            <span style={{fontSize:10,color:C.muted,background:C.accentL,padding:"1px 6px",borderRadius:8,fontWeight:600}}>{ck.portions}p</span>
+            <button onClick={()=>onRemove(ck.id)} style={{background:"none",border:"none",color:C.light,fontSize:12,cursor:"pointer",padding:0,lineHeight:1,flexShrink:0}}>×</button>
+          </div>
+        );
+      })}
+      <button onClick={onAdd} style={{background:"none",border:"none",color:C.accent,fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"Plus Jakarta Sans",textAlign:"left",padding:"1px 0"}}>+ Cuisiner</button>
+    </div>
+  );
+}
+
+// ── ADD COOK SHEET ────────────────────────────────────────────────
+function AddCookSheet({ recipes, onAdd, onClose }) {
+  const [search, setSearch] = useState("");
+  const [activeFilters, setActiveFilters] = useState([]);
+  const [chosenRecipe, setChosenRecipe] = useState(null);
+  const [chosenVariantId, setChosenVariantId] = useState(null);
+  const [portions, setPortions] = useState(4);
+  const [step, setStep] = useState("recipe");
+  const [chosenOptionals, setChosenOptionals] = useState({});
+
+  const toggleFilter = (tag) => {
+    setActiveFilters(prev => prev.includes(tag) ? prev.filter(t=>t!==tag) : [...prev, tag]);
+  };
+
+  const filtered = recipes
+    .filter(r => r.name.toLowerCase().includes(search.toLowerCase()))
+    .filter(r => {
+      for (const f of activeFilters) {
+        if (f === "déjeuner" && r.tags.mealType !== "lunch" && r.tags.mealType !== "both") return false;
+        if (f === "dîner" && r.tags.mealType !== "dinner" && r.tags.mealType !== "both") return false;
+        if (f === "les deux" && r.tags.mealType !== "both") return false;
+        if (f === "work-friendly" && !r.tags.workFriendly) return false;
+        if (f === "congélable" && !r.storage.freezerSafe) return false;
+        if (RECIPE_TAGS.type.includes(f) || RECIPE_TAGS.cuisine.includes(f) || RECIPE_TAGS.carac.filter(c=>c!=="congélable").includes(f)) {
+          if (!(r.tags.labels||[]).includes(f)) return false;
+        }
+      }
+      return true;
+    })
+    .sort((a,b)=>a.name.localeCompare(b.name,"fr"));
+
+  const pickRecipe = r => {
+    setChosenOptionals({});
+    setChosenRecipe(r); setPortions(r.defaultPortions);
+    if (r.variants.length>1) { setChosenVariantId(r.defaultVariantId); setStep("variant"); }
+    else { setChosenVariantId(r.variants[0].id); setStep("portions"); }
+  };
+  const confirm = () => onAdd({id:cid(),recipeId:chosenRecipe.id,variantId:chosenVariantId,portions,optionals:Object.keys(chosenOptionals).filter(k=>chosenOptionals[k])});
+  const variant = chosenRecipe ? getVariant(chosenRecipe,chosenVariantId) : null;
+
+  return (
+    <div className="overlay" onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div className="sheet slide-up">
+        <div style={{display:"flex",justifyContent:"center",padding:"12px 0 2px"}}><div style={{width:32,height:3,borderRadius:2,background:C.border}}/></div>
+        {step==="recipe" && (
+          <>
+            <div style={{padding:"10px 18px 10px"}}>
+              <h3 style={{fontSize:17,fontWeight:700,marginBottom:10}}>Qu'est-ce que tu cuisines ?</h3>
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Rechercher…" style={{marginBottom:10}}/>
+              <FilterAccordion activeFilters={activeFilters} onToggle={toggleFilter}/>
+            </div>
+            <div style={{overflowY:"auto",flex:1,padding:"0 18px 28px"}}>
+              {filtered.length === 0 && (
+                <p style={{textAlign:"center",color:C.muted,fontSize:13,padding:"24px 0"}}>Aucune recette trouvée</p>
+              )}
+              {filtered.map(r=>(
+                <div key={r.id} onClick={()=>pickRecipe(r)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 0",borderBottom:"1px solid "+C.border,cursor:"pointer"}}>
+                  <div>
+                    <p style={{fontSize:14,fontWeight:600,marginBottom:3}}>{r.name}</p>
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      {r.variants.length>1&&<span style={{fontSize:10,fontWeight:700,color:C.accent,background:C.accentL,padding:"1px 7px",borderRadius:8}}>{r.variants.length} variantes</span>}
+                      <p style={{fontSize:11,color:C.muted}}>{"Frigo "+r.storage.fridgeDays+"j"}</p>
+                    </div>
+                  </div>
+                  <span style={{fontSize:12,color:C.muted,marginLeft:8}}>{r.defaultPortions}p →</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {step==="variant" && chosenRecipe && (
+          <div style={{padding:"10px 18px 36px",display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <button onClick={()=>setStep("recipe")} style={{width:30,height:30,borderRadius:8,background:C.page,border:"1px solid "+C.border,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>←</button>
+              <h3 style={{fontSize:17,fontWeight:700}}>{chosenRecipe.name}</h3>
+            </div>
+            <p style={{fontSize:13,color:C.muted}}>Quelle variante aujourd'hui ?</p>
+            {chosenRecipe.variants.map(v=>(
+              <div key={v.id} onClick={()=>{setChosenVariantId(v.id);setStep("portions");}}
+                style={{padding:"13px 16px",borderRadius:12,border:"1.5px solid "+(v.id===chosenRecipe.defaultVariantId?C.accent:C.border),background:v.id===chosenRecipe.defaultVariantId?C.accentL:C.card,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <p style={{fontSize:14,fontWeight:600}}>{v.name||chosenRecipe.name}</p>
+                  <p style={{fontSize:11,color:C.muted,marginTop:2}}>{v.ingredients.filter(i=>!i.optional).length+" ingrédients principaux"}</p>
+                </div>
+                {v.id===chosenRecipe.defaultVariantId&&<span style={{fontSize:10,fontWeight:700,color:C.accent}}>Défaut</span>}
+              </div>
+            ))}
+          </div>
+        )}
+        {step==="portions" && chosenRecipe && variant && (()=>{
+          const hasOptionals = variant.ingredients.some(i=>i.optional);
+          const baseMacros = variant.macros||{calories:0,protein:0,carbs:0,fat:0};
+          const optMacros2 = (variant.optionalMacros||[]).filter(om=>
+            variant.ingredients.some(i=>i.optional&&i.name===om.name&&chosenOptionals[i.id])
+          );
+          const previewMacros = optMacros2.reduce((acc,om)=>({
+            calories:acc.calories+(om.calories||0),protein:acc.protein+(om.protein||0),
+            carbs:acc.carbs+(om.carbs||0),fat:acc.fat+(om.fat||0)
+          }), baseMacros);
+          return(
+            <div style={{padding:"10px 18px 36px",display:"flex",flexDirection:"column",gap:14}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <button onClick={()=>setStep(chosenRecipe.variants.length>1?"variant":"recipe")} style={{width:30,height:30,borderRadius:8,background:C.page,border:"1px solid "+C.border,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>←</button>
+                <div>
+                  <h3 style={{fontSize:17,fontWeight:700}}>{chosenRecipe.name}</h3>
+                  {variant.name&&<p style={{fontSize:12,color:C.accent,fontWeight:600,marginTop:1}}>{variant.name}</p>}
+                </div>
+              </div>
+              <div style={{background:C.page,borderRadius:12,padding:"14px 16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <div><p style={{fontSize:13,fontWeight:600}}>Portions à préparer</p><p style={{fontSize:11,color:C.muted,marginTop:2}}>Combien ce batch ?</p></div>
+                  <Stepper value={portions} onChange={setPortions}/>
+                </div>
+                <div style={{borderTop:"1px solid "+C.border,paddingTop:10}}>
+                  <p style={{fontSize:11,color:C.muted}}>{"Conservation : "}<strong style={{color:C.text}}>{chosenRecipe.storage.fridgeDays} jours</strong>{" au frigo"}{chosenRecipe.storage.freezerSafe&&<span style={{color:C.blue}}>{" · Congélable "}<strong>{chosenRecipe.storage.freezerMonths}m</strong></span>}</p>
+                </div>
+              </div>
+              {hasOptionals&&(
+                <div>
+                  <p style={{fontSize:12,fontWeight:700,marginBottom:8}}>Ingrédients optionnels</p>
+                  <p style={{fontSize:11,color:C.muted,marginBottom:10}}>Coche ce que tu vas mettre aujourd'hui :</p>
+                  {variant.ingredients.filter(i=>i.optional).map(ing=>(
+                    <div key={ing.id} onClick={()=>setChosenOptionals(p=>({...p,[ing.id]:!p[ing.id]}))}
+                      style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:C.card,borderRadius:9,marginBottom:6,border:"1px solid "+(chosenOptionals[ing.id]?C.amber:C.border),cursor:"pointer"}}>
+                      <div style={{width:18,height:18,borderRadius:4,border:"1.5px solid "+(chosenOptionals[ing.id]?C.amber:C.light),background:chosenOptionals[ing.id]?C.amberL:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                        {chosenOptionals[ing.id]&&<span style={{fontSize:10,color:C.amber,fontWeight:700}}>✓</span>}
+                      </div>
+                      <span style={{flex:1,fontSize:13,fontWeight:500}}>{ing.name}</span>
+                      <span style={{fontSize:11,color:C.muted}}>{ing.quantity} {ing.unit}</span>
+                    </div>
+                  ))}
+                  {baseMacros.calories>0&&(
+                    <div style={{marginTop:8,padding:"8px 12px",background:"#F0FDF4",borderRadius:9,display:"flex",gap:12,justifyContent:"center"}}>
+                      {[["🔥",previewMacros.calories,"kcal"],["💪",previewMacros.protein+"g","prot"],["🌾",previewMacros.carbs+"g","gluc"]].map(([ic,val,lbl])=>(
+                        <div key={lbl} style={{textAlign:"center"}}><span style={{fontSize:13}}>{ic}</span><p style={{fontSize:12,fontWeight:700}}>{val}</p><p style={{fontSize:9,color:C.muted}}>{lbl}</p></div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              <button onClick={confirm} className="btn btn-primary" style={{width:"100%",padding:13}}>Confirmer</button>
+            </div>
+          );
+        })()}
+      </div>
+    </div>
+  );
+}
+
+// ── MEAL PICKER SHEET ─────────────────────────────────────────────
+function MealPickerSheet({ mealType, available, onSelect, onClose }) {
+  return (
+    <div className="overlay" onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div className="sheet slide-up">
+        <div style={{display:"flex",justifyContent:"center",padding:"12px 0 2px"}}><div style={{width:32,height:3,borderRadius:2,background:C.border}}/></div>
+        <div style={{padding:"10px 18px 10px"}}>
+          <p style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8,marginBottom:2}}>{mealType==="lunch"?"Déjeuner":"Dîner"}</p>
+          <h3 style={{fontSize:17,fontWeight:700}}>Choisir un plat</h3>
+        </div>
+        <div style={{overflowY:"auto",flex:1,padding:"4px 18px 32px"}}>
+          {available.length===0&&(
+            <div style={{padding:"16px",background:C.amberL,borderRadius:12,marginBottom:12}}>
+              <p style={{fontSize:13,fontWeight:600,color:C.amber}}>Aucun batch disponible</p>
+              <p style={{fontSize:11,color:C.amber,marginTop:3}}>Ajoute un plat en "Cuisine" d'abord</p>
+            </div>
+          )}
+          {available.map(({cook,recipe,remaining,cookDate})=>{
+            const v = getVariant(recipe, cook.variantId);
+            const label = v&&v.name ? recipe.name+" · "+v.name : recipe.name;
+            const rc = remaining===1?C.amber:C.green;
+            const rb = remaining===1?C.amberL:C.greenL;
+            const cd = new Date(cookDate+"T12:00:00");
+            return (
+              <div key={cook.id} onClick={()=>onSelect({type:"batch",cookId:cook.id,recipeId:recipe.id})} style={{display:"flex",alignItems:"center",padding:"13px 0",borderBottom:"1px solid "+C.border,cursor:"pointer",gap:12}}>
+                <div style={{flex:1}}>
+                  <p style={{fontSize:14,fontWeight:600,marginBottom:3}}>{label}</p>
+                  <p style={{fontSize:11,color:C.muted}}>{"Cuisiné le "+cd.getDate()+" "+MONTH_FR[cd.getMonth()]}</p>
+                </div>
+                <span style={{fontSize:11,fontWeight:700,color:rc,background:rb,padding:"3px 9px",borderRadius:10,whiteSpace:"nowrap"}}>{remaining+" rest."}</span>
+              </div>
+            );
+          })}
+          <div onClick={()=>onSelect({type:"other"})} style={{display:"flex",alignItems:"center",padding:"13px 0",cursor:"pointer",gap:12}}>
+            <div style={{width:36,height:36,borderRadius:10,background:C.page,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>🍽️</div>
+            <div><p style={{fontSize:14,fontWeight:600,marginBottom:2}}>Autre</p><p style={{fontSize:11,color:C.muted}}>Resto, commande, chez quelqu'un…</p></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── MEAL SLOT TILE ────────────────────────────────────────────────
+function MealSlot({ slot, recipe, cook, remaining, label, onAdd, onRemove }) {
+  if (!slot) {
+    return (
+      <button onClick={onAdd} style={{width:"100%",minHeight:56,padding:"8px",borderRadius:10,border:"1.5px dashed "+C.border,background:"transparent",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3}}>
+        <span style={{fontSize:18,color:C.light,lineHeight:1}}>+</span>
+        <span style={{fontSize:10,color:C.light,fontFamily:"Plus Jakarta Sans",fontWeight:600,letterSpacing:.3,textTransform:"uppercase"}}>{label}</span>
+      </button>
+    );
+  }
+  if (slot.type==="other") {
+    return (
+      <button onClick={onRemove} style={{width:"100%",minHeight:56,padding:"8px",borderRadius:10,border:"1.5px solid "+C.border,background:C.page,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2}}>
+        <span style={{fontSize:16}}>🍽️</span>
+        <span style={{fontSize:10,color:C.sub,fontFamily:"Plus Jakarta Sans",fontWeight:600}}>Autre</span>
+      </button>
+    );
+  }
+  const rem = remaining!=null?remaining:0;
+  const rc = rem<=0?C.muted:rem===1?C.amber:C.green;
+  const rb = rem<=0?C.page:rem===1?C.amberL:C.greenL;
+  const v = recipe&&cook ? getVariant(recipe,cook.variantId) : null;
+  return (
+    <button onClick={onRemove} style={{width:"100%",minHeight:56,padding:"9px 10px",borderRadius:10,border:"1.5px solid #B8DEC9",background:"#EEF7F2",cursor:"pointer",textAlign:"left",display:"flex",flexDirection:"column",justifyContent:"space-between",gap:3}}>
+      <span style={{fontSize:12,fontWeight:700,color:C.text,lineHeight:1.3,display:"block"}}>{recipe?recipe.name:"?"}</span>
+      {v&&v.name&&<span style={{fontSize:10,color:C.accent,fontWeight:600}}>{v.name}</span>}
+      <span style={{fontSize:10,fontWeight:700,color:rc,background:rb,padding:"1px 7px",borderRadius:8,alignSelf:"flex-start"}}>{rem>0?rem+" rest.":rem===0?"dernier":""}</span>
+    </button>
+  );
+}
+
+// ── DAY CARD ──────────────────────────────────────────────────────
+function DayCard({ day, dayIdx, plan, recipes, onChange }) {
+  const [cookSheet, setCookSheet] = useState(false);
+  const [mealPicker, setMealPicker] = useState(null);
+  const today = isToday(day.date);
+  const dt = new Date(day.date+"T12:00:00");
+  const isEmpty = !day.lunch&&!day.dinner&&!(day.cooked||[]).length&&!(day.actions||[]).length;
+  const headerBg = today?"#FDF3EE":isEmpty?"transparent":"#F0F7F3";
+  const upd = patch => onChange(dayIdx,patch);
+  const addCook = ck => { upd({cooked:[...(day.cooked||[]),ck]}); setCookSheet(false); };
+  const removeCook = id => upd({cooked:(day.cooked||[]).filter(c=>c.id!==id),lunch:day.lunch&&day.lunch.cookId===id?null:day.lunch,dinner:day.dinner&&day.dinner.cookId===id?null:day.dinner});
+  const assignMeal = (mt,slot) => { upd({[mt]:slot}); setMealPicker(null); };
+  const available = getAvailable(plan,dayIdx,recipes);
+  const allCooked = plan.days.flatMap(d=>d.cooked||[]);
+  const lunchR = day.lunch&&day.lunch.type==="batch" ? recipes.find(r=>r.id===day.lunch.recipeId) : null;
+  const dinnerR = day.dinner&&day.dinner.type==="batch" ? recipes.find(r=>r.id===day.dinner.recipeId) : null;
+  const lunchCook = day.lunch&&day.lunch.cookId ? allCooked.find(c=>c.id===day.lunch.cookId) : null;
+  const dinnerCook = day.dinner&&day.dinner.cookId ? allCooked.find(c=>c.id===day.dinner.cookId) : null;
+  return (
+    <div style={{background:C.card,borderRadius:14,overflow:"hidden",border:today?"2px solid "+C.warn:"1px solid "+C.border,boxShadow:today?"0 2px 12px rgba(181,84,26,.12)":"0 1px 3px rgba(0,0,0,.04)"}}>
+      <div style={{padding:"10px 14px 8px",display:"flex",alignItems:"center",justifyContent:"space-between",borderBottom:"1px solid "+C.border,background:headerBg}}>
+        <div style={{display:"flex",alignItems:"baseline",gap:8}}>
+          <span style={{fontSize:22,fontWeight:700,color:today?C.warn:C.text,lineHeight:1}}>{dt.getDate()}</span>
+          <span style={{fontSize:13,fontWeight:600,color:today?C.warn:C.text}}>{DAY_FULL[dt.getDay()]}</span>
+          <span style={{fontSize:11,color:C.muted}}>{MONTH_FR[dt.getMonth()]}</span>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          {today&&<span style={{fontSize:10,fontWeight:700,background:C.warn,color:"white",padding:"2px 8px",borderRadius:10}}>Aujourd'hui</span>}
+          {isEmpty&&!today&&<span style={{fontSize:10,color:C.light}}>Jour libre</span>}
+        </div>
+      </div>
+      <div style={{background:C.log,borderBottom:"1px solid "+C.border,display:"flex",minHeight:52}}>
+        <div style={{flex:1,padding:"8px 10px 8px 14px",borderRight:"1px solid "+C.border}}>
+          <p style={{fontSize:9,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>Cuisine</p>
+          <CuisineList cooked={day.cooked||[]} recipes={recipes} onAdd={()=>setCookSheet(true)} onRemove={removeCook}/>
+        </div>
+        <div style={{flex:1,padding:"8px 10px 8px 10px"}}>
+          <p style={{fontSize:9,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>Actions</p>
+          <ActionsList actions={day.actions||[]} onChange={actions=>upd({actions})}/>
+        </div>
+      </div>
+      <div style={{display:"flex",background:C.card,padding:"10px 10px 10px 14px",gap:8}}>
+        <div style={{flex:1}}>
+          <p style={{fontSize:9,fontWeight:700,color:C.accent,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>Déjeuner</p>
+          <MealSlot slot={day.lunch} recipe={lunchR} cook={lunchCook} remaining={batchRemaining(plan,day.lunch&&day.lunch.cookId)} label="Déjeuner" onAdd={()=>setMealPicker("lunch")} onRemove={()=>upd({lunch:null})}/>
+        </div>
+        <div style={{flex:1}}>
+          <p style={{fontSize:9,fontWeight:700,color:C.accent,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>Dîner</p>
+          <MealSlot slot={day.dinner} recipe={dinnerR} cook={dinnerCook} remaining={batchRemaining(plan,day.dinner&&day.dinner.cookId)} label="Dîner" onAdd={()=>setMealPicker("dinner")} onRemove={()=>upd({dinner:null})}/>
+        </div>
+      </div>
+      {cookSheet&&<AddCookSheet recipes={recipes} onAdd={addCook} onClose={()=>setCookSheet(false)}/>}
+      {mealPicker&&<MealPickerSheet mealType={mealPicker} available={available} onSelect={s=>assignMeal(mealPicker,s)} onClose={()=>setMealPicker(null)}/>}
+    </div>
+  );
+}
+
+// ── WEEK VIEW ─────────────────────────────────────────────────────
+function WeekView({ plan, setPlan, monday, setMonday, recipes, onGrocery }) {
+  const key = "weekplan-"+toISO(monday);
+  const isCurrent = toISO(monday)===toISO(getMonday(new Date()));
+  const save = async up => { setPlan(up); await Store.save(key,up); };
+  const handleChange = async (dayIdx,patch) => {
+    const up = JSON.parse(JSON.stringify(plan));
+    Object.assign(up.days[dayIdx],patch);
+    await save(up);
+  };
+  const cookedCount = plan ? plan.days.reduce((acc,d)=>acc+(d.cooked||[]).length,0) : 0;
+  return (
+    <div style={{minHeight:"100vh",paddingBottom:130}}>
+      <div style={{padding:"16px 16px 12px",background:C.card,position:"sticky",top:0,zIndex:50,borderBottom:"1px solid "+C.border}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <button onClick={()=>setMonday(m=>addDays(m,-7))} style={{width:34,height:34,borderRadius:9,background:C.page,border:"1px solid "+C.border,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>‹</button>
+          <div style={{textAlign:"center"}}>
+            <p style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8}}>{isCurrent?"Cette semaine":"Semaine"}</p>
+            <p style={{fontSize:15,fontWeight:700,color:C.text,marginTop:1}}>{fmtRange(monday)}</p>
+          </div>
+          <button onClick={()=>setMonday(m=>addDays(m,7))} style={{width:34,height:34,borderRadius:9,background:C.page,border:"1px solid "+C.border,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>›</button>
+        </div>
+      </div>
+      <div style={{padding:"10px 12px",display:"flex",flexDirection:"column",gap:8}}>
+        {plan&&plan.days.map((day,i)=>(
+          <DayCard key={day.date} day={day} dayIdx={i} plan={plan} recipes={recipes} onChange={handleChange}/>
+        ))}
+      </div>
+      <div style={{position:"fixed",bottom:56,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,padding:"10px 14px",background:C.card,borderTop:"1px solid "+C.border,display:"flex",gap:8,zIndex:50}}>
+        <button disabled style={{flex:1,padding:"11px 0",borderRadius:10,background:C.page,border:"1px solid "+C.border,color:C.light,fontSize:12,fontWeight:600,cursor:"not-allowed",fontFamily:"Plus Jakarta Sans"}}>✨ Suggestion IA</button>
+        <button disabled={cookedCount===0} onClick={()=>cookedCount>0&&onGrocery()}
+          style={{flex:1,padding:"11px 0",borderRadius:10,background:cookedCount>0?C.accent:C.page,border:cookedCount>0?"none":"1px solid "+C.border,color:cookedCount>0?"white":C.light,fontSize:12,fontWeight:700,cursor:cookedCount>0?"pointer":"not-allowed",fontFamily:"Plus Jakarta Sans"}}>
+          {cookedCount>0?"🛒 Liste de courses":"🛒 Ajoute un plat d'abord"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── GROCERY VIEW ──────────────────────────────────────────────────
+// Simple rules:
+// 1. Always re-aggregate from plan on open — single source of truth
+// 2. Merge with saved checked state (by ingredient key)
+// 3. "Courses terminées" → clear saved state, show done screen
+// 4. Never save null to storage — use Store.clear()
+
+function GroceryView({ plan, recipes, onBack }) {
+  const [memory, setMemory] = useState({});
+  const [step, setStep] = useState("wait");
+  const [selMain, setSelMain] = useState([]);
+  const [selEss, setSelEss] = useState([]);
+  const [shopList, setShopList] = useState([]);
+  const [manual, setManual] = useState([]);
+  const [newManual, setNewManual] = useState("");
+  const [shoppedIds, setShoppedIds] = useState([]); // cookIds already bought
+  const manualRef = useRef(null);
+
+  useEffect(()=>{
+    if (!plan) return;
+    // Don't reset if we're already in a terminal state from this session
+    if (step === "done") return;
+    (async()=>{
+      try {
+        const mem = await Store.load("essentials-memory") || {};
+        setMemory(mem);
+        const sid = await Store.load("shopped-cook-ids") || [];
+        setShoppedIds(sid);
+        const saved = await Store.load("grocery-state");
+
+        // Compute unshipped cookIds — all days of the week
+        const allCookIds = plan.days.flatMap(d=>(d.cooked||[]).map(c=>c.id));
+        const pendingIds = allCookIds.filter(id=>!sid.includes(id));
+
+        if (pendingIds.length===0 && allCookIds.length>0) {
+          setStep("empty");
+          return;
+        }
+
+        // Restore in-progress shopping list if available
+        if (saved && saved.shopList && saved.shopList.length>0) {
+          setShopList(saved.shopList);
+          setManual(saved.manual||[]);
+          setStep("shopping");
+          return;
+        }
+
+        // Build fresh selection from pending batches only
+        const fresh = aggregateIngredients(plan, recipes, sid);
+        if (fresh.length===0) { setStep("empty"); return; }
+        const main = fresh.filter(i=>!i.isEssential).map(i=>({...i,checked:true}));
+        const ess  = fresh.filter(i=>i.isEssential).map(i=>({...i,checked:!mem[i.key]}));
+        setSelMain(main);
+        setSelEss(ess);
+        setStep("selection");
+      } catch(err) {
+        console.error("GroceryView error:", err);
+        setStep("selection");
+      }
+    })();
+  }, [plan]);
+
+  useEffect(()=>{
+    if (step==="shopping") Store.save("grocery-state", {shopList, manual});
+  }, [step, shopList, manual]);
+
+  const toggleEssential = async name => {
+    const key = name.toLowerCase().trim();
+    const item = selEss.find(i=>i.name===name);
+    if (!item) return;
+    const nowChecked = !item.checked;
+    setSelEss(prev=>prev.map(i=>i.name===name?{...i,checked:nowChecked}:i));
+    const newMem = {...memory};
+    if (!nowChecked) newMem[key]=true; else delete newMem[key];
+    setMemory(newMem);
+    await Store.save("essentials-memory", newMem);
+  };
+
+  const validate = () => {
+    const selected = [...selMain.filter(i=>i.checked), ...selEss.filter(i=>i.checked)].map(i=>({...i,checked:false}));
+    setShopList(selected);
+    setManual([]);
+    setStep("shopping");
+  };
+
+  const toggleShop = async name => {
+    setShopList(prev=>prev.map(i=>{
+      if (i.name!==name) return i;
+      const nowChecked = !i.checked;
+      if (i.isEssential && nowChecked) {
+        const nm = {...memory, [i.key]:true};
+        setMemory(nm);
+        Store.save("essentials-memory", nm);
+      }
+      return {...i, checked:nowChecked};
+    }));
+  };
+
+  const finishShopping = async () => {
+    // Mark all current cookIds as shopped
+    const allCookIds = plan.days.flatMap(d=>(d.cooked||[]).map(c=>c.id));
+    const newShoppedIds = [...new Set([...shoppedIds, ...allCookIds])];
+    setShoppedIds(newShoppedIds);
+    await Store.save("shopped-cook-ids", newShoppedIds);
+    await Store.clear("grocery-state");
+    setStep("done");
+    setTimeout(()=>{
+      try {
+        const blob = new Blob([JSON.stringify({recipes,memory,exportedAt:new Date().toISOString()},null,2)],{type:"application/json"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href=url; a.download="mealprep-backup-"+toISO(new Date())+".json";
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } catch(e){}
+    },100);
+  };
+
+  const catOrder = ["Légumes","Fruits","Viandes & Poissons","Produits laitiers","Féculents","Épices & essentiels","Autres"];
+  const groupBy = list => {
+    const g={};
+    for (const i of list) { if(!g[i.category])g[i.category]=[]; g[i.category].push(i); }
+    return g;
+  };
+  const sortCats = g => Object.keys(g).sort((a,b)=>(catOrder.indexOf(a)===-1?99:catOrder.indexOf(a))-(catOrder.indexOf(b)===-1?99:catOrder.indexOf(b)));
+  const checkedCount = shopList.filter(i=>i.checked).length + manual.filter(i=>i.checked).length;
+  const totalCount = shopList.length + manual.length;
+
+  // Wait for plan
+  if (step==="wait") {
+    return (
+      <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <p style={{color:C.muted}}>Chargement du planning…</p>
+      </div>
+    );
+  }
+
+  // Done
+  if (step==="done") {
+    return (
+      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,paddingBottom:80}}>
+        <div style={{fontSize:56,marginBottom:16}}>🎉</div>
+        <h2 style={{fontSize:22,fontWeight:700,marginBottom:8,textAlign:"center"}}>Courses effectuées !</h2>
+        <p style={{fontSize:14,color:C.muted,textAlign:"center",marginBottom:32,lineHeight:1.6}}>
+          Ces plats sont marqués comme achetés. Si tu ajoutes de nouveaux plats à cuisiner, leurs ingrédients apparaîtront dans une nouvelle liste.
+        </p>
+        <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%"}}>
+          <button onClick={onBack} className="btn btn-primary" style={{width:"100%",padding:14}}>Retour au planning</button>
+        </div>
+      </div>
+    );
+  }
+
+  // Empty — all cooked items already shopped
+  if (step==="empty") {
+    return (
+      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,paddingBottom:80}}>
+        <div style={{fontSize:48,marginBottom:12}}>✅</div>
+        <h2 style={{fontSize:18,fontWeight:700,marginBottom:8,textAlign:"center"}}>Tout est déjà acheté !</h2>
+        <p style={{fontSize:13,color:C.muted,textAlign:"center",marginBottom:24,lineHeight:1.6}}>
+          Tous les plats planifiés ont déjà été achetés. Ajoute de nouveaux plats à cuisiner pour générer une nouvelle liste.
+        </p>
+        <button onClick={onBack} className="btn btn-primary" style={{width:"100%",padding:13}}>Retour au planning</button>
+      </div>
+    );
+  }
+
+  // Shopping
+  if (step==="shopping") {
+    const grouped = groupBy(shopList);
+    const sorted = sortCats(grouped);
+    return (
+      <div style={{minHeight:"100vh",paddingBottom:100}}>
+        <div style={{padding:"14px 16px",background:C.card,position:"sticky",top:0,zIndex:50,borderBottom:"1px solid "+C.border}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+            <button onClick={()=>setStep("selection")} style={{width:32,height:32,borderRadius:8,background:C.page,border:"1px solid "+C.border,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>←</button>
+            <div style={{flex:1}}>
+              <h2 style={{fontSize:18,fontWeight:700}}>Liste de courses</h2>
+              <p style={{fontSize:11,color:C.muted,marginTop:1}}>{checkedCount+"/"+totalCount+" articles cochés"}</p>
+            </div>
+          </div>
+          <div style={{height:4,background:C.border,borderRadius:2,overflow:"hidden"}}>
+            <div style={{height:"100%",background:C.accent,borderRadius:2,width:totalCount>0?(checkedCount/totalCount*100)+"%":"0%",transition:"width .3s"}}/>
+          </div>
+        </div>
+        <div style={{padding:"12px 16px 80px"}}>
+          {sorted.map(cat=>(
+            <div key={cat} style={{marginBottom:20}}>
+              <p style={{fontSize:10,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:8,paddingLeft:4}}>{cat}</p>
+              {grouped[cat].map(item=>(
+                <div key={item.name} onClick={()=>toggleShop(item.name)}
+                  style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",background:C.card,borderRadius:10,marginBottom:6,border:"1px solid "+C.border,cursor:"pointer",opacity:item.checked?.5:1,transition:"opacity .15s"}}>
+                  <div style={{width:20,height:20,borderRadius:6,border:"2px solid "+(item.checked?C.accent:C.border),background:item.checked?C.accent:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .15s"}}>
+                    {item.checked&&<span style={{color:"white",fontSize:11,fontWeight:700,lineHeight:1}}>✓</span>}
+                  </div>
+                  <span style={{flex:1,fontSize:14,fontWeight:500,textDecoration:item.checked?"line-through":"none",color:item.checked?C.muted:C.text}}>{item.name}</span>
+                  <span style={{fontSize:12,color:C.muted,whiteSpace:"nowrap"}}>{item.qty>0?item.qty+" "+item.unit:item.unit}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+          <div style={{marginBottom:20}}>
+            <p style={{fontSize:10,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:8,paddingLeft:4}}>Autres articles</p>
+            {manual.map(m=>(
+              <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",background:C.card,borderRadius:10,marginBottom:6,border:"1px solid "+C.border}}>
+                <div onClick={()=>setManual(p=>p.map(x=>x.id===m.id?{...x,checked:!x.checked}:x))} style={{width:20,height:20,borderRadius:6,border:"2px solid "+(m.checked?C.accent:C.border),background:m.checked?C.accent:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,cursor:"pointer",transition:"all .15s"}}>
+                  {m.checked&&<span style={{color:"white",fontSize:11,fontWeight:700,lineHeight:1}}>✓</span>}
+                </div>
+                <span onClick={()=>setManual(p=>p.map(x=>x.id===m.id?{...x,checked:!x.checked}:x))} style={{flex:1,fontSize:14,fontWeight:500,textDecoration:m.checked?"line-through":"none",color:m.checked?C.muted:C.text,cursor:"pointer"}}>{m.text}</span>
+                <button onClick={()=>setManual(p=>p.filter(x=>x.id!==m.id))} style={{background:"none",border:"none",color:C.light,fontSize:16,cursor:"pointer",padding:0,lineHeight:1}}>×</button>
+              </div>
+            ))}
+            <div style={{display:"flex",gap:8,marginTop:8}}>
+              <input ref={manualRef} value={newManual} onChange={e=>setNewManual(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&newManual.trim()){setManual(p=>[...p,{id:"m-"+Date.now(),text:newManual.trim(),checked:false}]);setNewManual("");}}} placeholder="Ajouter un article…" style={{flex:1,borderRadius:10,fontSize:14,padding:"10px 12px"}}/>
+              <button onClick={()=>{if(newManual.trim()){setManual(p=>[...p,{id:"m-"+Date.now(),text:newManual.trim(),checked:false}]);setNewManual("");}}} style={{padding:"10px 16px",borderRadius:10,background:C.accent,color:"white",border:"none",fontSize:14,fontWeight:600,cursor:"pointer",fontFamily:"Plus Jakarta Sans",whiteSpace:"nowrap"}}>+ Ajouter</button>
+            </div>
+          </div>
+        </div>
+        <div style={{position:"fixed",bottom:56,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,padding:"10px 16px",background:C.card,borderTop:"1px solid "+C.border,zIndex:50}}>
+          <button onClick={finishShopping} className="btn btn-primary" style={{width:"100%",padding:14,fontSize:15,borderRadius:12}}>✓ Courses terminées</button>
+        </div>
+      </div>
+    );
+  }
+
+  // Selection
+  const checkedMain = selMain.filter(i=>i.checked).length;
+  const checkedEss = selEss.filter(i=>i.checked).length;
+  const noItems = selMain.length===0 && selEss.length===0;
+  return (
+    <div style={{minHeight:"100vh",paddingBottom:100}}>
+      <div style={{padding:"16px 16px 12px",background:C.card,position:"sticky",top:0,zIndex:50,borderBottom:"1px solid "+C.border}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <button onClick={onBack} style={{width:32,height:32,borderRadius:8,background:C.page,border:"1px solid "+C.border,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>←</button>
+          <div>
+            <h1 style={{fontSize:20,fontWeight:700}}>Préparer les courses</h1>
+            <p style={{fontSize:11,color:C.muted,marginTop:1}}>Décoche ce que tu as déjà</p>
+          </div>
+        </div>
+      </div>
+      <div style={{padding:"14px 16px 90px"}}>
+        {noItems ? (
+          <div style={{textAlign:"center",padding:"60px 0"}}>
+            <div style={{fontSize:40,marginBottom:12}}>🛒</div>
+            <p style={{fontSize:15,fontWeight:600,color:C.muted}}>Aucun plat à cuisiner planifié</p>
+            <p style={{fontSize:13,color:C.light,marginTop:6}}>Ajoute des plats dans la colonne Cuisine de ton planning.</p>
+          </div>
+        ) : (
+          <>
+            <div style={{marginBottom:24}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                <div><p style={{fontSize:13,fontWeight:700}}>À acheter</p><p style={{fontSize:11,color:C.muted,marginTop:1}}>Ingrédients frais et principaux</p></div>
+                <span style={{fontSize:11,fontWeight:700,color:C.accent,background:C.accentL,padding:"3px 9px",borderRadius:10}}>{checkedMain+"/"+selMain.length}</span>
+              </div>
+              {selMain.map(item=>(
+                <div key={item.name} onClick={()=>setSelMain(prev=>prev.map(i=>i.name===item.name?{...i,checked:!i.checked}:i))}
+                  style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",background:C.card,borderRadius:10,marginBottom:6,border:"1px solid "+C.border,cursor:"pointer",opacity:item.checked?1:.5,transition:"opacity .15s"}}>
+                  <div style={{width:20,height:20,borderRadius:6,border:"2px solid "+(item.checked?C.accent:C.border),background:item.checked?C.accent:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .15s"}}>
+                    {item.checked&&<span style={{color:"white",fontSize:11,fontWeight:700,lineHeight:1}}>✓</span>}
+                  </div>
+                  <span style={{flex:1,fontSize:14,fontWeight:500}}>{item.name}</span>
+                  <span style={{fontSize:12,color:C.muted,whiteSpace:"nowrap"}}>{item.qty>0?item.qty+" "+item.unit:item.unit}</span>
+                </div>
+              ))}
+            </div>
+            {selEss.length>0&&(
+              <div style={{marginBottom:24}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                  <div><p style={{fontSize:13,fontWeight:700}}>Épices & essentiels</p><p style={{fontSize:11,color:C.muted,marginTop:1}}>Coche ce qui te manque</p></div>
+                  <span style={{fontSize:11,fontWeight:700,color:C.amber,background:C.amberL,padding:"3px 9px",borderRadius:10}}>{checkedEss+"/"+selEss.length}</span>
+                </div>
+                <div style={{background:"#FFFDF5",border:"1px solid #EDE8C0",borderRadius:10,padding:"8px 12px",marginBottom:10}}>
+                  <p style={{fontSize:11,color:"#8B7A20"}}>💡 Les articles décochés sont mémorisés pour la prochaine fois.</p>
+                </div>
+                {selEss.map(item=>(
+                  <div key={item.name} onClick={()=>toggleEssential(item.name)}
+                    style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",background:C.card,borderRadius:10,marginBottom:6,border:"1px solid "+C.border,cursor:"pointer",opacity:item.checked?1:.5,transition:"opacity .15s"}}>
+                    <div style={{width:20,height:20,borderRadius:6,border:"2px solid "+(item.checked?C.amber:C.border),background:item.checked?C.amber:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .15s"}}>
+                      {item.checked&&<span style={{color:"white",fontSize:11,fontWeight:700,lineHeight:1}}>✓</span>}
+                    </div>
+                    <span style={{flex:1,fontSize:14,fontWeight:500}}>{item.name}</span>
+                    <div style={{display:"flex",alignItems:"center",gap:6}}>
+                      {memory[item.key]&&!item.checked&&<span style={{fontSize:10,color:C.green,background:C.greenL,padding:"1px 6px",borderRadius:8,fontWeight:600}}>En stock</span>}
+                      <span style={{fontSize:12,color:C.muted,whiteSpace:"nowrap"}}>{item.qty>0?item.qty+" "+item.unit:item.unit}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      {!noItems&&(
+        <div style={{position:"fixed",bottom:56,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,padding:"10px 16px",background:C.card,borderTop:"1px solid "+C.border,zIndex:50}}>
+          <button onClick={validate} className="btn btn-primary" style={{width:"100%",padding:14,fontSize:15,borderRadius:12}}>
+            {"Valider ma sélection ("+(checkedMain+checkedEss)+" articles)"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── RECIPE LIST ───────────────────────────────────────────────────
+function FilterAccordion({ activeFilters, onToggle }) {
+  const [openCat, setOpenCat] = useState(null);
+  const totalActive = activeFilters.length;
+  return (
+    <div style={{marginBottom:4}}>
+      {totalActive > 0 && (
+        <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:8}}>
+          {activeFilters.map(f => (
+            <button key={f} onClick={()=>onToggle(f)}
+              style={{display:"flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:20,fontSize:11,fontWeight:700,background:C.accent,color:"white",border:"none",cursor:"pointer"}}>
+              {f} <span style={{fontSize:13,lineHeight:1}}>×</span>
+            </button>
+          ))}
+          <button onClick={()=>activeFilters.forEach(f=>onToggle(f))}
+            style={{padding:"4px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:C.page,color:C.muted,border:"1px solid "+C.border,cursor:"pointer"}}>
+            Tout effacer
+          </button>
+        </div>
+      )}
+      <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:4}}>
+        {FILTER_CATS.map(cat => {
+          const hasActive = cat.tags.some(t => activeFilters.includes(t));
+          const isOpen = openCat === cat.key;
+          return (
+            <button key={cat.key}
+              onClick={()=>setOpenCat(isOpen ? null : cat.key)}
+              style={{flexShrink:0,padding:"6px 13px",borderRadius:20,fontSize:12,fontWeight:700,cursor:"pointer",border:"1.5px solid",whiteSpace:"nowrap",fontFamily:"Plus Jakarta Sans",
+                background: hasActive ? C.accent : isOpen ? C.accentL : "transparent",
+                color: hasActive ? "white" : isOpen ? C.accent : C.muted,
+                borderColor: hasActive || isOpen ? C.accent : C.border}}>
+              {cat.label}{hasActive ? " ·" + cat.tags.filter(t=>activeFilters.includes(t)).length : ""}{isOpen ? " ▲" : " ▾"}
+            </button>
+          );
+        })}
+      </div>
+      {openCat && (
+        <div style={{marginTop:8,display:"flex",gap:6,flexWrap:"wrap",padding:"10px 12px",background:C.accentL,borderRadius:12}}>
+          {FILTER_CATS.find(c=>c.key===openCat)?.tags.map(tag => {
+            const on = activeFilters.includes(tag);
+            return (
+              <button key={tag} onClick={()=>onToggle(tag)}
+                style={{padding:"5px 12px",borderRadius:20,fontSize:12,fontWeight:600,cursor:"pointer",border:"1.5px solid",fontFamily:"Plus Jakarta Sans",
+                  background: on ? C.accent : C.card,
+                  color: on ? "white" : C.text,
+                  borderColor: on ? C.accent : C.border}}>
+                {tag}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecipeList({ recipes, onSelect, onCreate }) {
+  const [search, setSearch] = useState("");
+  const [activeFilters, setActiveFilters] = useState([]);
+  const [catFilter, setCatFilter] = useState("all");
+
+  const toggleFilter = (tag) => {
+    setActiveFilters(prev => prev.includes(tag) ? prev.filter(t=>t!==tag) : [...prev, tag]);
+  };
+
+  const visible = recipes
+    .filter(r => {
+      const q = search.toLowerCase();
+      return r.name.toLowerCase().includes(q) || (r.tags.labels||[]).some(t=>t.includes(q));
+    })
+    .filter(r => {
+      if (catFilter !== "all") {
+        if (catFilter === "mine" && r.category !== "mine") return false;
+        if (catFilter === "suggested" && r.category !== "suggested") return false;
+      }
+      // AND logic across active filters
+      for (const f of activeFilters) {
+        if (f === "déjeuner" && r.tags.mealType !== "lunch" && r.tags.mealType !== "both") return false;
+        if (f === "dîner" && r.tags.mealType !== "dinner" && r.tags.mealType !== "both") return false;
+        if (f === "les deux" && r.tags.mealType !== "both") return false;
+        if (f === "work-friendly" && !r.tags.workFriendly) return false;
+        if (f === "congélable" && !r.storage.freezerSafe) return false;
+        if (RECIPE_TAGS.type.includes(f) || RECIPE_TAGS.cuisine.includes(f) || RECIPE_TAGS.carac.filter(c=>c!=="congélable").includes(f)) {
+          if (!(r.tags.labels||[]).includes(f)) return false;
+        }
+      }
+      return true;
+    })
+    .sort((a,b) => a.name.localeCompare(b.name,"fr"));
+  return (
+    <div style={{minHeight:"100vh",background:C.page}}>
+      <div style={{padding:"20px 16px 10px",background:C.card,position:"sticky",top:0,zIndex:10,borderBottom:"1px solid "+C.border}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <div>
+            <p style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8}}>Bibliothèque</p>
+            <h1 style={{fontSize:24,fontWeight:700,color:C.text,marginTop:1}}>{recipes.length+" recettes"}</h1>
+          </div>
+          <button onClick={onCreate} style={{width:42,height:42,borderRadius:12,background:C.accent,border:"none",color:"white",fontSize:22,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+        </div>
+        <input placeholder="Rechercher par nom ou tag…" value={search} onChange={e=>setSearch(e.target.value)} style={{borderRadius:10,marginBottom:10}}/>
+        <div style={{display:"flex",gap:6,marginBottom:8}}>
+          {[["all","Toutes"],["mine","Mes recettes"],["suggested","Suggérées"]].map(([val,lbl])=>(
+            <button key={val} onClick={()=>setCatFilter(val)} className={"chip "+(catFilter===val?"chip-on":"chip-off")}>{lbl}</button>
+          ))}
+        </div>
+        <FilterAccordion activeFilters={activeFilters} onToggle={toggleFilter}/>
+      </div>
+      <div style={{padding:"10px 12px 100px"}}>
+        {visible.length===0?(
+          <div style={{textAlign:"center",padding:"60px 0",color:C.muted}}><div style={{fontSize:40,marginBottom:12}}>🥘</div><p style={{fontSize:15,fontWeight:600}}>{search?"Aucun résultat":"Aucune recette encore"}</p></div>
+        ):[["mine","Mes recettes"],["suggested","Recettes suggérées"]].map(([cat,catLabel])=>{
+          const group = visible.filter(r=>r.category===cat);
+          if(group.length===0) return null;
+          return(
+            <div key={cat} style={{marginBottom:8}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,marginTop:cat==="suggested"?16:0}}>
+                <p style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:1}}>{catLabel}</p>
+                <div style={{flex:1,height:1,background:C.border}}/>
+                <span style={{fontSize:10,fontWeight:600,color:C.muted,background:C.page,padding:"1px 8px",borderRadius:10}}>{group.length}</span>
+              </div>
+              {group.map((r,i)=>{
+                const defV = r.variants.find(v=>v.id===r.defaultVariantId)||r.variants[0];
+                const macros = defV?.macros;
+                return(
+                  <div key={r.id} className="fade-up" onClick={()=>onSelect(r.id)} style={{background:C.card,borderRadius:12,border:"1px solid "+C.border,padding:"13px 14px",cursor:"pointer",marginBottom:8,animationDelay:(i*0.04)+"s",boxShadow:"0 1px 3px rgba(0,0,0,.04)"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,marginBottom:7}}>
+                      <span style={{fontSize:15,fontWeight:700,lineHeight:1.25}}>{r.name}</span>
+                      <div style={{display:"flex",gap:5,flexShrink:0,alignItems:"center"}}>
+                        {r.variants.length>1&&<span style={{fontSize:10,fontWeight:700,color:C.accent,background:C.accentL,padding:"2px 7px",borderRadius:8}}>{r.variants.length+" var."}</span>}
+                        <span style={{background:C.accentL,color:C.accent,padding:"3px 9px",borderRadius:9,fontSize:11,fontWeight:700}}>{r.defaultPortions+"p"}</span>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:6}}>
+                      <MealTag mealType={r.tags.mealType}/>
+                      {r.tags.workFriendly&&<span style={{display:"inline-flex",padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:C.greenL,color:C.green}}>Work ✓</span>}
+                      {r.storage.freezerSafe&&<span style={{display:"inline-flex",padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:C.blueL,color:C.blue}}>❄ Congel</span>}
+                      {(r.tags.labels||[]).slice(0,3).map(tag=><TagChip key={tag} tag={tag} small/>)}
+                    </div>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:11,color:C.muted}}>{"Frigo "+r.storage.fridgeDays+"j"}</span>
+                      {macros&&macros.calories>0&&<span style={{fontSize:11,color:C.sub,fontWeight:500}}>{macros.calories+"kcal · "+macros.protein+"g prot"}</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function RecipeDetail({ recipe, onEdit, onDelete, onBack }) {
+  const [portions, setPortions] = useState(recipe.defaultPortions);
+  const [activeVId, setActiveVId] = useState(recipe.defaultVariantId);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  // Local optional toggles — resets when leaving
+  const [activeOptionals, setActiveOptionals] = useState({});
+  const toggleOpt = id => setActiveOptionals(p=>({...p,[id]:!p[id]}));
+
+  // Reset optionals when variant changes
+  useEffect(()=>setActiveOptionals({}), [activeVId]);
+
+  const variant = getVariant(recipe,activeVId)||recipe.variants[0];
+  const factor = portions/recipe.defaultPortions;
+
+  // Live macros including toggled optionals
+  const baseMacros = variant.macros||{calories:0,protein:0,carbs:0,fat:0};
+  const optMacros = (variant.optionalMacros||[]).filter(om=>
+    variant.ingredients.some(i=>i.optional&&i.name===om.name&&activeOptionals[i.id])
+  );
+  const liveMacros = optMacros.reduce((acc,om)=>({
+    calories: acc.calories+(om.calories||0),
+    protein:  acc.protein+(om.protein||0),
+    carbs:    acc.carbs+(om.carbs||0),
+    fat:      acc.fat+(om.fat||0)
+  }), baseMacros);
+  const hasMacros = baseMacros.calories>0;
+  const hasOptActive = optMacros.length>0;
+
+  const mainIngs = variant.ingredients.filter(i=>!isEssential(i.name));
+  const essIngs  = variant.ingredients.filter(i=>isEssential(i.name));
+  const renderRow = (ing,idx,arr) => (
+    <div key={ing.id||idx} onClick={ing.optional?()=>toggleOpt(ing.id):undefined}
+      style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 14px",borderBottom:idx<arr.length-1?"1px solid "+C.border:"none",background:idx%2===0?"transparent":"#FDFCFA",cursor:ing.optional?"pointer":"default",opacity:ing.optional&&!activeOptionals[ing.id]?.55:1}}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {ing.optional&&(
+          <div style={{width:16,height:16,borderRadius:4,border:"1.5px solid "+(activeOptionals[ing.id]?C.amber:C.light),background:activeOptionals[ing.id]?C.amberL:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .15s"}}>
+            {activeOptionals[ing.id]&&<span style={{fontSize:9,color:C.amber,fontWeight:700}}>✓</span>}
+          </div>
+        )}
+        {ing.optional&&!activeOptionals[ing.id]&&<span style={{fontSize:9,fontWeight:700,color:C.muted,background:C.page,padding:"1px 5px",borderRadius:5,border:"1px solid "+C.border,whiteSpace:"nowrap"}}>OPT.</span>}
+        <span style={{fontSize:13}}>{ing.name}</span>
+      </div>
+      <span style={{fontSize:13,fontWeight:600,color:factor!==1?C.accent:C.text}}>{fmtQ(+ing.quantity*factor)} <span style={{fontWeight:400,color:C.muted,fontSize:11}}>{ing.unit}</span></span>
+    </div>
+  );
+  return (
+    <div style={{minHeight:"100vh",background:C.page,paddingBottom:100}}>
+      <div style={{padding:"12px 14px",background:C.card,position:"sticky",top:0,zIndex:10,borderBottom:"1px solid "+C.border,display:"flex",alignItems:"center",gap:10}}>
+        <button onClick={onBack} style={{width:34,height:34,borderRadius:9,background:C.page,border:"1px solid "+C.border,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>←</button>
+        <h2 style={{fontSize:17,fontWeight:700,flex:1,lineHeight:1.2}}>{recipe.name}</h2>
+        <button onClick={onEdit} style={{padding:"6px 14px",borderRadius:9,background:C.accentL,border:"none",color:C.accent,fontSize:13,fontWeight:700,cursor:"pointer"}}>Modifier</button>
+      </div>
+      <div style={{padding:"14px"}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
+          <MealTag mealType={recipe.tags.mealType}/>
+          {recipe.tags.workFriendly&&<span style={{display:"inline-flex",padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:C.greenL,color:C.green}}>Work-friendly ✓</span>}
+          {(recipe.tags.labels||[]).map(tag=><TagChip key={tag} tag={tag} small/>)}
+        </div>
+        {recipe.variants.length>1&&(
+          <div style={{marginBottom:14}}>
+            <p style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8,marginBottom:8}}>Variante</p>
+            <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+              {recipe.variants.map(v=>(
+                <button key={v.id} onClick={()=>setActiveVId(v.id)} className={"chip "+(activeVId===v.id?"chip-on":"chip-off")}>
+                  {v.name}{v.id===recipe.defaultVariantId?" ★":""}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div style={{background:C.accentL,border:"1px solid #C8E4D4",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
+          <p style={{fontSize:10,fontWeight:700,color:C.accent,textTransform:"uppercase",letterSpacing:.8,marginBottom:7}}>Conservation</p>
+          <div style={{display:"flex",gap:16,flexWrap:"wrap",marginBottom:recipe.storage.perishableNotes?6:0}}>
+            <span style={{fontSize:13}}>{"Frigo : "}<strong>{recipe.storage.fridgeDays+"j"}</strong></span>
+            {recipe.storage.freezerSafe?<span style={{fontSize:13}}>{"❄ Congel : "}<strong>{recipe.storage.freezerMonths+"m"}</strong></span>:<span style={{fontSize:13,color:C.muted}}>Non congélable</span>}
+          </div>
+          {recipe.storage.perishableNotes&&<p style={{fontSize:11,color:C.sub}}>{"⚠ "+recipe.storage.perishableNotes}</p>}
+        </div>
+        {/* Macros block */}
+        {hasMacros&&(
+          <div style={{background:"#F0FDF4",border:"1px solid "+(hasOptActive?"#86EFAC":"#C8E4C8"),borderRadius:12,padding:"12px 14px",marginBottom:14,transition:"border-color .2s"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <p style={{fontSize:10,fontWeight:700,color:C.green,textTransform:"uppercase",letterSpacing:.8}}>Valeurs nutritionnelles · par portion</p>
+              {hasOptActive&&<span style={{fontSize:10,color:C.amber,fontWeight:700,background:C.amberL,padding:"1px 7px",borderRadius:10}}>+ options</span>}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8}}>
+              {[["🔥","Calories",liveMacros.calories,"kcal"],["💪","Protéines",liveMacros.protein,"g"],["🌾","Glucides",liveMacros.carbs,"g"],["🥑","Lipides",liveMacros.fat,"g"]].map(([icon,label,val,unit])=>(
+                <div key={label} style={{textAlign:"center"}}>
+                  <p style={{fontSize:16,marginBottom:2}}>{icon}</p>
+                  <p style={{fontSize:13,fontWeight:700,color:C.text}}>{val}{unit}</p>
+                  <p style={{fontSize:9,color:C.muted,fontWeight:600,textTransform:"uppercase",letterSpacing:.5}}>{label}</p>
+                </div>
+              ))}
+            </div>
+            {variant.ingredients.some(i=>i.optional)&&<p style={{fontSize:10,color:C.muted,marginTop:8,textAlign:"center"}}>💡 Clique sur un ingrédient optionnel pour l'inclure dans le calcul</p>}
+          </div>
+        )}
+        <div style={{background:C.card,borderRadius:12,border:"1px solid "+C.border,padding:"12px 14px",marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div><p style={{fontSize:13,fontWeight:600}}>Aperçu pour… portions</p><p style={{fontSize:11,color:C.muted,marginTop:1}}>Les quantités s'adaptent</p></div>
+          <Stepper value={portions} onChange={setPortions}/>
+        </div>
+        {mainIngs.length>0&&(
+          <div style={{background:C.card,borderRadius:12,border:"1px solid "+C.border,marginBottom:10,overflow:"hidden"}}>
+            <div style={{padding:"11px 14px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between"}}>
+              <p style={{fontSize:13,fontWeight:700}}>Ingrédients</p>
+              {factor!==1&&<span style={{fontSize:11,color:C.accent,fontWeight:700}}>{"pour "+portions+"p ✦"}</span>}
+            </div>
+            {mainIngs.map((ing,i,arr)=>renderRow(ing,i,arr))}
+          </div>
+        )}
+        {essIngs.length>0&&(
+          <div style={{background:C.card,borderRadius:12,border:"1px solid "+C.amberL,marginBottom:14,overflow:"hidden"}}>
+            <div style={{padding:"11px 14px",borderBottom:"1px solid "+C.amberL,display:"flex",justifyContent:"space-between",background:"#FFFDF7"}}>
+              <p style={{fontSize:13,fontWeight:700,color:C.amber}}>Épices & essentiels</p>
+              {factor!==1&&<span style={{fontSize:11,color:C.accent,fontWeight:700}}>{"pour "+portions+"p ✦"}</span>}
+            </div>
+            {essIngs.map((ing,i,arr)=>renderRow(ing,i,arr))}
+          </div>
+        )}
+        {variant.steps&&variant.steps.filter(s=>s.trim()).length>0&&(
+          <div style={{background:C.card,borderRadius:12,border:"1px solid "+C.border,marginBottom:14,overflow:"hidden"}}>
+            <div style={{padding:"11px 14px",borderBottom:"1px solid "+C.border}}><p style={{fontSize:13,fontWeight:700}}>Préparation</p></div>
+            <div style={{padding:"12px 14px",display:"flex",flexDirection:"column",gap:12}}>
+              {variant.steps.filter(s=>s.trim()).map((step,i)=>(
+                <div key={i} style={{display:"flex",gap:10}}>
+                  <div style={{width:22,height:22,borderRadius:"50%",background:C.accentL,color:C.accent,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,flexShrink:0,marginTop:1}}>{i+1}</div>
+                  <p style={{fontSize:13,lineHeight:1.6,paddingTop:2}}>{step}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {variant.notes&&(
+          <div style={{background:"#FFFEF5",border:"1px solid #EDE8C0",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
+            <p style={{fontSize:10,fontWeight:700,color:"#8B7A20",textTransform:"uppercase",letterSpacing:.8,marginBottom:5}}>Notes</p>
+            <p style={{fontSize:13,lineHeight:1.6}}>{variant.notes}</p>
+          </div>
+        )}
+        <button disabled style={{width:"100%",padding:12,borderRadius:10,background:C.card,border:"1.5px dashed "+C.border,color:C.light,fontSize:13,cursor:"not-allowed",fontFamily:"Plus Jakarta Sans",marginBottom:14}}>
+          🤖 Demander à Claude — bientôt
+        </button>
+        {confirmDelete?(
+          <div style={{background:C.redL,border:"1px solid #F5C0BB",borderRadius:12,padding:14}}>
+            <p style={{fontSize:13,fontWeight:600,color:C.red,marginBottom:10}}>{"Supprimer « "+recipe.name+" » ?"}</p>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>setConfirmDelete(false)} className="btn btn-ghost" style={{flex:1,padding:"10px"}}>Annuler</button>
+              <button onClick={onDelete} className="btn btn-danger" style={{flex:1,padding:"10px"}}>Supprimer</button>
+            </div>
+          </div>
+        ):(
+          <button onClick={()=>setConfirmDelete(true)} className="btn btn-danger" style={{width:"100%"}}>Supprimer la recette</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Sec({ title, children }) {
+  return (
+    <div style={{marginBottom:20}}>
+      <p style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>{title}</p>
+      {children}
+    </div>
+  );
+}
+
+function RecipeEditor({ initial, onSave, onBack }) {
+  const [r, setR] = useState(()=>initial?JSON.parse(JSON.stringify(initial)):EMPTY_RECIPE());
+  const [activeVIdx, setActiveVIdx] = useState(0);
+  const [prevPort, setPrevPort] = useState(r.defaultPortions);
+
+  const setTop = (path,val) => setR(prev=>{
+    const c=JSON.parse(JSON.stringify(prev)); const parts=path.split("."); let o=c;
+    for(let i=0;i<parts.length-1;i++) o=o[parts[i]]; o[parts[parts.length-1]]=val; return c;
+  });
+  const chgPort = n => {
+    const f=n/prevPort;
+    setR(p=>({...p,defaultPortions:n,variants:p.variants.map(v=>({...v,ingredients:v.ingredients.map(ing=>({...ing,quantity:ing.quantity===""?"":parseFloat((parseFloat(ing.quantity||0)*f).toFixed(2))}))}))}));
+    setPrevPort(n);
+  };
+  const updV = patch => setR(p=>{const vs=p.variants.map((v,i)=>i===activeVIdx?{...v,...patch}:v);return{...p,variants:vs};});
+  const setIng = (i,k,v) => updV({ingredients:r.variants[activeVIdx].ingredients.map((x,j)=>j===i?{...x,[k]:v}:x)});
+  const addIng = () => updV({ingredients:[...r.variants[activeVIdx].ingredients,{id:iid(),name:"",quantity:"",unit:"",optional:false}]});
+  const delIng = i => updV({ingredients:r.variants[activeVIdx].ingredients.filter((_,j)=>j!==i)});
+  const setStep = (i,v) => updV({steps:r.variants[activeVIdx].steps.map((s,j)=>j===i?v:s)});
+  const addStep = () => updV({steps:[...r.variants[activeVIdx].steps,""]});
+  const delStep = i => updV({steps:r.variants[activeVIdx].steps.filter((_,j)=>j!==i)});
+  const addVariant = () => { const nv=EMPTY_VARIANT(); setR(p=>({...p,variants:[...p.variants,nv]})); setActiveVIdx(r.variants.length); };
+  const delVariant = idx => {
+    if(r.variants.length<=1) return;
+    const nv=r.variants.filter((_,i)=>i!==idx);
+    const nd=r.defaultVariantId===r.variants[idx].id?nv[0].id:r.defaultVariantId;
+    setR(p=>({...p,variants:nv,defaultVariantId:nd}));
+    setActiveVIdx(Math.min(idx,nv.length-1));
+  };
+  const [calcMacros, setCalcMacros] = useState(false);
+  const save = async () => {
+    if(!r.name.trim()){alert("Donne un nom à la recette !");return;}
+    const cleaned = {...r, variants:r.variants.map(v=>({...v,ingredients:v.ingredients.filter(x=>x.name.trim()),steps:v.steps.filter(s=>s.trim())}))};
+    // Check if ingredients changed vs initial — if so, recalculate macros
+    const sig = v => v.ingredients.map(i=>i.name+i.quantity+i.unit+i.optional).join("|");
+    const hasChanges = !initial || initial.variants.map(sig).join("||") !== cleaned.variants.map(sig).join("||");
+    if(hasChanges) {
+      setCalcMacros(true);
+      try {
+        const result = await calculateMacrosViaAI(cleaned.name, cleaned.variants, cleaned.defaultPortions);
+        if(result && result.variants) {
+          cleaned.variants = cleaned.variants.map(v => {
+            const key = v.name||"default";
+            const found = result.variants[key] || result.variants[Object.keys(result.variants)[0]];
+            if(!found) return v;
+            return {
+              ...v,
+              macros: found.base || v.macros,
+              optionalMacros: found.optionals || []
+            };
+          });
+        }
+      } catch(e){ console.error(e); }
+      setCalcMacros(false);
+    }
+    onSave(cleaned);
+  };
+  const av = r.variants[activeVIdx];
+  const multiV = r.variants.length>1;
+
+  return (
+    <div style={{minHeight:"100vh",background:C.page,paddingBottom:100}}>
+      {calcMacros&&<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <div style={{background:C.card,borderRadius:16,padding:"28px 32px",textAlign:"center",maxWidth:280}}>
+          <div style={{fontSize:36,marginBottom:12}}>🧮</div>
+          <p style={{fontSize:15,fontWeight:700,marginBottom:6}}>Calcul des macros…</p>
+          <p style={{fontSize:12,color:C.muted}}>Claude analyse les ingrédients</p>
+        </div>
+      </div>}
+      <div style={{display:"flex",alignItems:"center",gap:10,padding:"12px 14px",background:C.card,position:"sticky",top:0,zIndex:10,borderBottom:"1px solid "+C.border}}>
+        <button onClick={onBack} className="btn btn-ghost" style={{padding:"7px 12px",fontSize:13}}>Annuler</button>
+        <h2 style={{fontSize:16,fontWeight:700,flex:1}}>{initial?"Modifier":"Nouvelle recette"}</h2>
+        <button onClick={save} disabled={calcMacros} className="btn btn-primary" style={{padding:"7px 16px",fontSize:13,opacity:calcMacros?.6:1}}>{calcMacros?"Calcul…":"Sauver"}</button>
+      </div>
+      <div style={{padding:"18px 14px"}}>
+        <Sec title="Nom"><input value={r.name} onChange={e=>setTop("name",e.target.value)} placeholder="Ex: Burritos, Spaghetti…" style={{fontSize:16,fontWeight:600}}/></Sec>
+        <Sec title="Tags">
+          {Object.entries(RECIPE_TAGS).map(([fam,tags])=>{
+            const col = TAG_COLORS[fam];
+            const famLabel = fam==="type"?"Type de plat":fam==="cuisine"?"Cuisine":"Caractéristiques";
+            return(
+              <div key={fam} style={{marginBottom:10}}>
+                <p style={{fontSize:10,color:C.muted,fontWeight:600,marginBottom:6,textTransform:"uppercase",letterSpacing:.6}}>{famLabel}</p>
+                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                  {tags.map(tag=>{
+                    const on=(r.tags.labels||[]).includes(tag);
+                    return <button key={tag} onClick={()=>setTop("tags.labels",on?(r.tags.labels||[]).filter(t=>t!==tag):[...(r.tags.labels||[]),tag])}
+                      style={{padding:"4px 11px",borderRadius:20,border:"1.5px solid "+(on?col.c:C.border),background:on?col.bg:"transparent",fontSize:11,fontWeight:600,cursor:"pointer",color:on?col.c:C.muted}}>{tag}</button>;
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </Sec>
+        <Sec title="Type de repas">
+          <div style={{display:"flex",gap:7,marginBottom:10}}>
+            {[["both","Déj+Dîner"],["lunch","Déjeuner"],["dinner","Dîner"]].map(([v,l])=>(
+              <button key={v} onClick={()=>setTop("tags.mealType",v)} className={"chip "+(r.tags.mealType===v?"chip-on":"chip-off")} style={{flex:1,textAlign:"center"}}>{l}</button>
+            ))}
+          </div>
+          <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div><p style={{fontSize:13,fontWeight:600}}>Work-friendly</p><p style={{fontSize:11,color:C.muted}}>Transportable en boîte</p></div>
+            <Toggle on={r.tags.workFriendly} onToggle={()=>setTop("tags.workFriendly",!r.tags.workFriendly)} colorOn={C.green}/>
+          </div>
+        </Sec>
+        <Sec title="Portions par défaut">
+          <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div><p style={{fontSize:13,fontWeight:600}}>Nombre de portions</p><p style={{fontSize:11,color:C.muted}}>Les quantités s'adaptent</p></div>
+            <Stepper value={r.defaultPortions} onChange={chgPort}/>
+          </div>
+        </Sec>
+        <Sec title="Variantes">
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
+            {r.variants.map((v,i)=>(
+              <button key={v.id} onClick={()=>setActiveVIdx(i)}
+                style={{padding:"6px 12px",borderRadius:9,border:"1.5px solid "+(activeVIdx===i?C.accent:C.border),background:activeVIdx===i?C.accentL:C.card,fontSize:12,fontWeight:600,cursor:"pointer",color:activeVIdx===i?C.accent:C.text,display:"flex",alignItems:"center",gap:5}}>
+                {v.name||"Recette de base"}
+                {v.id===r.defaultVariantId&&<span style={{fontSize:9,color:C.accent}}>★</span>}
+              </button>
+            ))}
+            <button onClick={addVariant} style={{padding:"6px 12px",borderRadius:9,border:"1.5px dashed "+C.border,background:"transparent",fontSize:12,fontWeight:600,cursor:"pointer",color:C.muted}}>+ Variante</button>
+          </div>
+          <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"12px",marginBottom:12,display:"flex",flexDirection:"column",gap:10}}>
+            <div>
+              <p style={{fontSize:11,color:C.muted,marginBottom:5}}>Nom de cette variante</p>
+              <input value={av.name} onChange={e=>updV({name:e.target.value})} placeholder={multiV?"Ex: Au poulet, Viande hachée…":"Laisser vide si pas de variantes"}/>
+            </div>
+            {multiV&&(
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>setTop("defaultVariantId",av.id)} style={{flex:1,padding:"8px",borderRadius:8,border:"1.5px solid "+(r.defaultVariantId===av.id?C.accent:C.border),background:r.defaultVariantId===av.id?C.accentL:C.card,fontSize:12,fontWeight:600,cursor:"pointer",color:r.defaultVariantId===av.id?C.accent:C.muted}}>
+                  {r.defaultVariantId===av.id?"★ Défaut":"Définir par défaut"}
+                </button>
+                <button onClick={()=>delVariant(activeVIdx)} style={{padding:"8px 12px",borderRadius:8,border:"1.5px solid "+C.border,background:C.card,fontSize:12,cursor:"pointer",color:C.red}}>Supprimer</button>
+              </div>
+            )}
+          </div>
+        </Sec>
+        <Sec title="Ingrédients">
+          <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,overflow:"hidden"}}>
+            {av.ingredients.map((ing,i)=>(
+              <div key={ing.id||i} style={{padding:"10px",borderBottom:i<av.ingredients.length-1?"1px solid "+C.border:"none"}}>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
+                  <button onClick={()=>setIng(i,"optional",!ing.optional)} title={ing.optional?"Optionnel":"Obligatoire"}
+                    style={{width:22,height:22,borderRadius:5,border:"1.5px solid "+(ing.optional?C.amber:C.border),background:ing.optional?C.amberL:"transparent",flexShrink:0,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:700,color:C.amber}}>
+                    {ing.optional?"O":""}
+                  </button>
+                  <input value={ing.name} onChange={e=>setIng(i,"name",e.target.value)} placeholder="Ingrédient"
+                    style={{flex:1,border:"none",background:"transparent",padding:"3px 0",fontSize:13,outline:"none"}}/>
+                  <button onClick={()=>delIng(i)} style={{width:24,height:24,borderRadius:5,background:"none",border:"none",color:C.light,cursor:"pointer",fontSize:18,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+                </div>
+                <div style={{display:"flex",gap:8,paddingLeft:28}}>
+                  <div style={{flex:1}}>
+                    <p style={{fontSize:9,color:C.muted,marginBottom:3}}>Quantité</p>
+                    <input value={ing.quantity} onChange={e=>setIng(i,"quantity",e.target.value)} placeholder="0" type="number" min="0" step="any"
+                      style={{width:"100%",border:"1px solid "+C.border,borderRadius:7,padding:"6px 8px",fontSize:13,textAlign:"center"}}/>
+                  </div>
+                  <div style={{flex:1}}>
+                    <p style={{fontSize:9,color:C.muted,marginBottom:3}}>Unité</p>
+                    <input value={ing.unit} onChange={e=>setIng(i,"unit",e.target.value)} placeholder="g, ml…"
+                      style={{width:"100%",border:"1px solid "+C.border,borderRadius:7,padding:"6px 8px",fontSize:13}}/>
+                  </div>
+                </div>
+              </div>
+            ))}
+            <div style={{padding:"8px 10px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <button onClick={addIng} style={{background:"none",border:"none",color:C.accent,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"Plus Jakarta Sans"}}>+ Ingrédient</button>
+              <span style={{fontSize:10,color:C.muted}}>Case O = optionnel</span>
+            </div>
+          </div>
+        </Sec>
+        <Sec title="Étapes">
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {av.steps.map((step,i)=>(
+              <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+                <div style={{width:22,height:22,borderRadius:"50%",background:C.accentL,color:C.accent,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,flexShrink:0,marginTop:9}}>{i+1}</div>
+                <textarea value={step} onChange={e=>setStep(i,e.target.value)} placeholder={"Étape "+(i+1)+"…"} style={{flex:1,minHeight:60,fontSize:13}}/>
+                <button onClick={()=>delStep(i)} style={{width:24,height:24,marginTop:9,borderRadius:5,background:"none",border:"none",color:C.light,cursor:"pointer",fontSize:16,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+              </div>
+            ))}
+            <button onClick={addStep} style={{background:"none",border:"none",color:C.accent,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"Plus Jakarta Sans",textAlign:"left"}}>+ Étape</button>
+          </div>
+        </Sec>
+        <Sec title="Conservation">
+          <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"12px",display:"flex",flexDirection:"column",gap:12}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><p style={{fontSize:13}}>Jours au frigo</p><Stepper value={r.storage.fridgeDays} onChange={v=>setTop("storage.fridgeDays",v)} min={1} max={14}/></div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><p style={{fontSize:13}}>Congélable</p><Toggle on={r.storage.freezerSafe} onToggle={()=>setTop("storage.freezerSafe",!r.storage.freezerSafe)} colorOn={C.blue}/></div>
+            {r.storage.freezerSafe&&<div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><p style={{fontSize:13}}>Mois au congélateur</p><Stepper value={r.storage.freezerMonths||1} onChange={v=>setTop("storage.freezerMonths",v)} min={1} max={12}/></div>}
+            <textarea value={r.storage.perishableNotes} onChange={e=>setTop("storage.perishableNotes",e.target.value)} placeholder="Notes de conservation (optionnel)" style={{minHeight:56,fontSize:12}}/>
+          </div>
+        </Sec>
+        <Sec title="Notes">
+          <textarea value={av.notes} onChange={e=>updV({notes:e.target.value})} placeholder="Astuces, variantes, substitutions…"/>
+        </Sec>
+        <Sec title="Valeurs nutritionnelles (par portion)">
+          <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"12px",display:"flex",flexDirection:"column",gap:10}}>
+            <p style={{fontSize:11,color:C.muted,marginBottom:2}}>Laisser à 0 si inconnu — tu pourras compléter plus tard.</p>
+            {[["calories","🔥 Calories","kcal"],["protein","💪 Protéines","g"],["carbs","🌾 Glucides","g"],["fat","🥑 Lipides","g"]].map(([key,label,unit])=>(
+              <div key={key} style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <p style={{fontSize:13}}>{label}</p>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <input type="number" min="0" step="1" value={(av.macros&&av.macros[key])||0}
+                    onChange={e=>updV({macros:{...(av.macros||{calories:0,protein:0,carbs:0,fat:0}),[key]:parseFloat(e.target.value)||0}})}
+                    style={{width:80,textAlign:"center",padding:"6px 8px",borderRadius:7,fontSize:13}}/>
+                  <span style={{fontSize:12,color:C.muted,minWidth:24}}>{unit}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Sec>
+        <button onClick={save} className="btn btn-primary" style={{width:"100%",padding:14,fontSize:15,borderRadius:11}}>✓ Sauvegarder</button>
+      </div>
+    </div>
+  );
+}
+
+// ── DEBUG PANEL ───────────────────────────────────────────────────
+function DebugPanel({ onClose }) {
+  const [diag, setDiag] = useState(null);
+  useEffect(()=>{
+    (async()=>{
+      const result = {
+        userAgent: navigator.userAgent,
+        winStorageExists: typeof window !== "undefined" && !!window.storage,
+        winStorageHasGet: typeof window !== "undefined" && window.storage && typeof window.storage.get === "function",
+        winStorageBrokenFlag: _winStorageBroken,
+        winStorageWriteRead: "not tested",
+        localStorageExists: false,
+        localStorageWriteRead: "not tested",
+        memCacheKeys: Object.keys(_memCache),
+        shoppedIdsInMem: _memCache["shopped-cook-ids"] || "(absent)",
+        groceryStateInMem: _memCache["grocery-state"] ? "present" : "(absent)",
+        essentialsInMem: _memCache["essentials-memory"] ? "present" : "(absent)",
+        shoppedIdsFromWinStorage: "not tested",
+        shoppedIdsFromLocalStorage: "not tested",
+      };
+      if (result.winStorageHasGet) {
+        try {
+          await window.storage.set("__debug_test", JSON.stringify({t: Date.now()}));
+          const back = await window.storage.get("__debug_test");
+          result.winStorageWriteRead = back ? "OK" : "wrote but read returned null";
+          await window.storage.delete("__debug_test");
+        } catch(e) {
+          result.winStorageWriteRead = "ERROR: " + (e.message || e);
+        }
+      }
+      try {
+        localStorage.setItem("__debug_test", "1");
+        const v = localStorage.getItem("__debug_test");
+        localStorage.removeItem("__debug_test");
+        result.localStorageExists = true;
+        result.localStorageWriteRead = v === "1" ? "OK" : "inconsistent";
+      } catch(e) {
+        result.localStorageExists = false;
+        result.localStorageWriteRead = "BLOCKED: " + (e.message || e);
+      }
+      if (result.winStorageHasGet) {
+        try {
+          const r = await window.storage.get("shopped-cook-ids");
+          result.shoppedIdsFromWinStorage = r ? r.value : "(null)";
+        } catch(e) {
+          result.shoppedIdsFromWinStorage = "ERR " + (e.message || e);
+        }
+      }
+      if (result.localStorageExists) {
+        try {
+          result.shoppedIdsFromLocalStorage = localStorage.getItem("mpa_shopped-cook-ids") || "(null)";
+        } catch(e) {
+          result.shoppedIdsFromLocalStorage = "ERR " + (e.message || e);
+        }
+      }
+      setDiag(result);
+    })();
+  },[]);
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:999,display:"flex",alignItems:"center",justifyContent:"center",padding:12}}
+      onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{background:"white",borderRadius:12,padding:16,maxWidth:480,width:"100%",maxHeight:"90vh",overflowY:"auto",fontFamily:"monospace",fontSize:11}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <strong style={{fontSize:14}}>🔧 Storage Diagnostic</strong>
+          <button onClick={onClose} style={{padding:"6px 12px",borderRadius:6,border:"1px solid #ccc",background:"white",cursor:"pointer"}}>Fermer</button>
+        </div>
+        {!diag ? <p>Tests en cours…</p> : (
+          <pre style={{whiteSpace:"pre-wrap",wordBreak:"break-all",margin:0,fontSize:10,lineHeight:1.5}}>
+{`User Agent:
+  ${diag.userAgent}
+
+window.storage:
+  exists: ${diag.winStorageExists}
+  has .get: ${diag.winStorageHasGet}
+  circuit-breaker tripped: ${diag.winStorageBrokenFlag}
+  write+read: ${diag.winStorageWriteRead}
+
+localStorage:
+  exists: ${diag.localStorageExists}
+  write+read: ${diag.localStorageWriteRead}
+
+In-memory cache:
+  keys: ${diag.memCacheKeys.length === 0 ? "(empty)" : diag.memCacheKeys.join(", ")}
+  shopped-cook-ids in mem: ${typeof diag.shoppedIdsInMem === "object" ? JSON.stringify(diag.shoppedIdsInMem) : diag.shoppedIdsInMem}
+  grocery-state in mem: ${diag.groceryStateInMem}
+  essentials-memory in mem: ${diag.essentialsInMem}
+
+Direct reads of shopped-cook-ids:
+  from window.storage: ${diag.shoppedIdsFromWinStorage}
+  from localStorage: ${diag.shoppedIdsFromLocalStorage}
+`}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── APP ROOT ──────────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("week");
+  const [recipes, setRecipes] = useState([]);
+  const [plan, setPlan] = useState(null);
+  const [monday, setMonday] = useState(()=>getMonday(new Date()));
+  const [rv, setRv] = useState("list");
+  const [selId, setSelId] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState(null);
+  const [showDebug, setShowDebug] = useState(false);
+
+  const notify = msg => { setToast(msg); setTimeout(()=>setToast(null),2500); };
+
+  useEffect(()=>{
+    (async()=>{
+      try {
+        const DATA_VERSION = "v7-tags";
+        const storedVersion = await Store.load("data-version");
+        const stored = await Store.load("recipes");
+        if (stored && stored.length>0 && storedVersion===DATA_VERSION) {
+          setRecipes(stored.map(migrateRecipe));
+        } else {
+          const seed = makeSeed();
+          setRecipes(seed);
+          await Store.save("recipes", seed);
+          await Store.save("data-version", DATA_VERSION);
+          await Store.clear("grocery-state");
+          await Store.clear("shopped-cook-ids");
+        }
+      } catch(err) {
+        console.error("App init error:", err);
+        setRecipes(makeSeed());
+      }
+      setLoading(false);
+    })();
+  },[]);
+
+  const persist = async up => { setRecipes(up); await Store.save("recipes",up); };
+
+  // Load plan when monday changes (survives tab switches)
+  useEffect(()=>{
+    (async()=>{
+      const key = "weekplan-"+toISO(monday);
+      const s = await Store.load(key);
+      setPlan(s || buildEmpty(monday));
+    })();
+  },[monday]);
+  const saveR = async r => {
+    const e = recipes.find(x=>x.id===r.id);
+    const up = e ? recipes.map(x=>x.id===r.id?r:x) : [...recipes,r];
+    await persist(up); setSelId(r.id); setRv("detail"); notify("✓ Recette sauvegardée");
+  };
+  const delR = async id => { await persist(recipes.filter(r=>r.id!==id)); setRv("list"); notify("Recette supprimée"); };
+  const sel = recipes.find(r=>r.id===selId);
+
+  if (loading) return (
+    <>
+      <style>{CSS}</style>
+      <div className="app" style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:C.page}}>
+        <div style={{textAlign:"center"}}><div style={{fontSize:44,marginBottom:12}}>🍳</div><p style={{color:C.muted,fontWeight:500}}>Chargement…</p></div>
+      </div>
+    </>
+  );
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div className="app" style={{background:C.page}}>
+        {tab==="week" && <WeekView plan={plan} setPlan={setPlan} monday={monday} setMonday={setMonday} recipes={recipes} onGrocery={()=>setTab("grocery")}/>}
+        {tab==="recipes"&&rv==="list" && <RecipeList recipes={recipes} onSelect={id=>{setSelId(id);setRv("detail");}} onCreate={()=>{setEditing(null);setRv("editor");}}/>}
+        {tab==="recipes"&&rv==="detail"&&sel && <RecipeDetail recipe={sel} onEdit={()=>{setEditing(sel);setRv("editor");}} onDelete={()=>delR(sel.id)} onBack={()=>setRv("list")}/>}
+        {tab==="recipes"&&rv==="editor" && <RecipeEditor initial={editing} onSave={saveR} onBack={()=>setRv(editing?"detail":"list")}/>}
+        {tab==="grocery" && <GroceryView plan={plan} recipes={recipes} onBack={()=>setTab("week")}/>}
+        <BottomNav active={tab} onChange={t=>{ setTab(t); if(t==="recipes") setRv("list"); }}/>
+        {toast&&<div style={{position:"fixed",bottom:70,left:"50%",transform:"translateX(-50%)",background:C.text,color:"white",padding:"10px 20px",borderRadius:20,fontSize:13,fontWeight:600,zIndex:200,whiteSpace:"nowrap",pointerEvents:"none"}}>{toast}</div>}
+        <button onClick={()=>setShowDebug(true)} title="Storage diagnostic"
+          style={{position:"fixed",top:8,right:8,zIndex:300,width:32,height:32,borderRadius:"50%",background:"rgba(0,0,0,0.55)",color:"white",border:"none",fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>🔧</button>
+        {showDebug && <DebugPanel onClose={()=>setShowDebug(false)}/>}
+      </div>
+    </>
+  );
+}
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(App));
+  </script>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js');
+      });
+    }
+  </script>
+</body>
+</html>
