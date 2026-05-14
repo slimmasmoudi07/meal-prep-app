@@ -20,9 +20,7 @@
 <body>
   <div id="root"></div>
   <script>
-// Extract React hooks for global use
-const { useState, useEffect, useRef, useCallback, useMemo, useContext, useReducer } = React;
-
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 // ── RECIPE TAGS ───────────────────────────────────────────────────
 const RECIPE_TAGS = {
   type: ["soupe", "salade", "pâtes", "riz & bowl", "viande", "poisson", "burger", "sandwich", "collation"],
@@ -6741,6 +6739,8 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
+  const [driveStatus, setDriveStatus] = useState("unknown"); // "unknown"|"connected"|"disconnected"
+
   const notify = msg => {
     setToast(msg);
     setTimeout(() => setToast(null), 2500);
@@ -6752,8 +6752,28 @@ function App() {
         const storedVersion = await Store.load("data-version");
         const stored = await Store.load("recipes");
         if (stored && stored.length > 0 && storedVersion === DATA_VERSION) {
+          // Normal load from local storage
           setRecipes(stored.map(migrateRecipe));
+          // Check if Drive is connected (silently)
+          const t = await DriveSync.getToken();
+          setDriveStatus(t ? "connected" : "disconnected");
         } else {
+          // Fresh install — try to restore from Drive first
+          const t = await DriveSync.getToken();
+          setDriveStatus(t ? "connected" : "disconnected");
+          if (t) {
+            const driveRecipes = await DriveSync.restoreRecipes();
+            if (driveRecipes && driveRecipes.length > 0) {
+              const migrated = driveRecipes.map(migrateRecipe);
+              setRecipes(migrated);
+              await Store.save("recipes", migrated);
+              await Store.save("data-version", DATA_VERSION);
+              notify("✓ Recettes restaurées depuis Google Drive");
+              setLoading(false);
+              return;
+            }
+          }
+          // No Drive data either — use seed
           const seed = makeSeed();
           setRecipes(seed);
           await Store.save("recipes", seed);
@@ -6771,6 +6791,8 @@ function App() {
   const persist = async up => {
     setRecipes(up);
     await Store.save("recipes", up);
+    // Silent Drive backup on every recipe change
+    DriveSync.saveRecipes(up);
   };
 
   // Load plan when monday changes (survives tab switches)
@@ -6879,7 +6901,57 @@ function App() {
       whiteSpace: "nowrap",
       pointerEvents: "none"
     }
-  }, toast), /*#__PURE__*/React.createElement("button", {
+  }, toast), driveStatus === "disconnected" && /*#__PURE__*/React.createElement("button", {
+    onClick: async () => {
+      try {
+        const {
+          token,
+          expires
+        } = await DriveSync.authenticate();
+        await DriveSync.saveToken(token, expires);
+        setDriveStatus("connected");
+        await DriveSync.saveRecipes(recipes);
+        notify("✓ Google Drive connecté — recettes sauvegardées");
+      } catch (e) {
+        notify("Connexion Drive annulée");
+      }
+    },
+    style: {
+      position: "fixed",
+      bottom: 76,
+      right: 12,
+      zIndex: 150,
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
+      padding: "8px 14px",
+      borderRadius: 20,
+      background: "white",
+      border: "1.5px solid #E2E8F0",
+      boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
+      fontSize: 12,
+      fontWeight: 600,
+      color: "#374151",
+      cursor: "pointer"
+    }
+  }, "\u2601\uFE0F Sauvegarder sur Drive"), driveStatus === "connected" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      bottom: 76,
+      right: 12,
+      zIndex: 150,
+      display: "flex",
+      alignItems: "center",
+      gap: 4,
+      padding: "6px 12px",
+      borderRadius: 20,
+      background: "#F0FDF4",
+      border: "1px solid #86EFAC",
+      fontSize: 11,
+      fontWeight: 600,
+      color: "#166534"
+    }
+  }, "\u2601\uFE0F Drive \u2713"), /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowDebug(true),
     title: "Storage diagnostic",
     style: {
@@ -6903,6 +6975,174 @@ function App() {
     onClose: () => setShowDebug(false)
   })));
 }
+
+// ── GOOGLE DRIVE SYNC ─────────────────────────────────────────────
+const GDRIVE_CLIENT_ID = "842052475718-tee9soidisd1rjr20onhh2epi2mg5cmh.apps.googleusercontent.com";
+const GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+const BACKUP_FILENAME = "mealprep-backup.json";
+const DriveSync = {
+  _token: null,
+  _fileId: null,
+  // Get stored token
+  async getToken() {
+    if (this._token) return this._token;
+    const t = await Store.load("gdrive-token");
+    if (t && t.expiry > Date.now()) {
+      this._token = t.access_token;
+      return this._token;
+    }
+    return null;
+  },
+  // Save token
+  async saveToken(access_token, expires_in) {
+    const t = {
+      access_token,
+      expiry: Date.now() + (expires_in - 60) * 1000
+    };
+    this._token = access_token;
+    await Store.save("gdrive-token", t);
+  },
+  // Clear token (on auth error)
+  async clearToken() {
+    this._token = null;
+    this._fileId = null;
+    await Store.clear("gdrive-token");
+    await Store.clear("gdrive-file-id");
+  },
+  // Launch OAuth popup
+  async authenticate() {
+    return new Promise((resolve, reject) => {
+      const params = new URLSearchParams({
+        client_id: GDRIVE_CLIENT_ID,
+        redirect_uri: window.location.origin,
+        response_type: "token",
+        scope: GDRIVE_SCOPE,
+        prompt: "consent"
+      });
+      const url = "https://accounts.google.com/o/oauth2/v2/auth?" + params;
+      const popup = window.open(url, "gdrive-auth", "width=500,height=600,left=100,top=100");
+      if (!popup) {
+        reject(new Error("Popup blocked"));
+        return;
+      }
+      const timer = setInterval(() => {
+        try {
+          if (!popup || popup.closed) {
+            clearInterval(timer);
+            reject(new Error("Popup closed"));
+            return;
+          }
+          const href = popup.location.href;
+          if (href.startsWith(window.location.origin)) {
+            popup.close();
+            clearInterval(timer);
+            const hash = new URLSearchParams(href.split("#")[1] || "");
+            const token = hash.get("access_token");
+            const expires = parseInt(hash.get("expires_in") || "3600");
+            if (token) resolve({
+              token,
+              expires
+            });else reject(new Error("No token in response"));
+          }
+        } catch (e) {/* cross-origin, keep waiting */}
+      }, 300);
+    });
+  },
+  // Find or create backup file in appData folder
+  async getFileId(token) {
+    if (this._fileId) return this._fileId;
+    const stored = await Store.load("gdrive-file-id");
+    if (stored) {
+      this._fileId = stored;
+      return stored;
+    }
+
+    // Search for existing file
+    const search = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='${BACKUP_FILENAME}'&fields=files(id,name)`, {
+      headers: {
+        Authorization: "Bearer " + token
+      }
+    });
+    const data = await search.json();
+    if (data.files && data.files.length > 0) {
+      this._fileId = data.files[0].id;
+      await Store.save("gdrive-file-id", this._fileId);
+      return this._fileId;
+    }
+    return null; // File doesn't exist yet
+  },
+  // Save recipes to Drive (silent)
+  async saveRecipes(recipes) {
+    try {
+      const token = await this.getToken();
+      if (!token) return; // Not authenticated, skip silently
+
+      const content = JSON.stringify({
+        recipes,
+        savedAt: new Date().toISOString(),
+        version: "v1"
+      });
+      const fileId = await this.getFileId(token);
+      if (fileId) {
+        // Update existing file
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+          method: "PATCH",
+          headers: {
+            Authorization: "Bearer " + token,
+            "Content-Type": "application/json"
+          },
+          body: content
+        });
+      } else {
+        // Create new file in appData
+        const meta = JSON.stringify({
+          name: BACKUP_FILENAME,
+          parents: ["appDataFolder"]
+        });
+        const boundary = "meal_prep_boundary";
+        const body = `--${boundary}\r\nContent-Type: application/json\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${content}\r\n--${boundary}--`;
+        const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer " + token,
+            "Content-Type": `multipart/related; boundary=${boundary}`
+          },
+          body
+        });
+        const created = await res.json();
+        if (created.id) {
+          this._fileId = created.id;
+          await Store.save("gdrive-file-id", created.id);
+        }
+      }
+    } catch (e) {
+      console.warn("DriveSync.saveRecipes failed silently:", e.message);
+    }
+  },
+  // Restore recipes from Drive (on fresh install)
+  async restoreRecipes() {
+    try {
+      const token = await this.getToken();
+      if (!token) return null;
+      const fileId = await this.getFileId(token);
+      if (!fileId) return null;
+      const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+        headers: {
+          Authorization: "Bearer " + token
+        }
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.recipes || null;
+    } catch (e) {
+      console.warn("DriveSync.restoreRecipes failed:", e.message);
+      return null;
+    }
+  },
+  isAuthenticated() {
+    return !!this._token;
+  }
+};
   ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
   </script>
   <script>
