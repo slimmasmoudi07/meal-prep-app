@@ -3894,13 +3894,15 @@ function WeekView({
   monday,
   setMonday,
   recipes,
-  onGrocery
+  onGrocery,
+  onDriveSave
 }) {
   const key = "weekplan-" + toISO(monday);
   const isCurrent = toISO(monday) === toISO(getMonday(new Date()));
   const save = async up => {
     setPlan(up);
     await Store.save(key, up);
+    if (onDriveSave) onDriveSave(null, up, monday);
   };
   const handleChange = async (dayIdx, patch) => {
     const up = JSON.parse(JSON.stringify(plan));
@@ -6749,37 +6751,44 @@ function App() {
     (async () => {
       try {
         const DATA_VERSION = "v7-tags";
+
+        // Check Drive auth status
+        const token = await DriveSync.getToken();
+        setDriveStatus(token ? "connected" : "disconnected");
         const storedVersion = await Store.load("data-version");
-        const stored = await Store.load("recipes");
-        if (stored && stored.length > 0 && storedVersion === DATA_VERSION) {
-          // Normal load from local storage
-          setRecipes(stored.map(migrateRecipe));
-          // Check if Drive is connected (silently)
-          const t = await DriveSync.getToken();
-          setDriveStatus(t ? "connected" : "disconnected");
-        } else {
-          // Fresh install — try to restore from Drive first
-          const t = await DriveSync.getToken();
-          setDriveStatus(t ? "connected" : "disconnected");
-          if (t) {
-            const driveRecipes = await DriveSync.restoreRecipes();
-            if (driveRecipes && driveRecipes.length > 0) {
-              const migrated = driveRecipes.map(migrateRecipe);
-              setRecipes(migrated);
-              await Store.save("recipes", migrated);
-              await Store.save("data-version", DATA_VERSION);
-              notify("✓ Recettes restaurées depuis Google Drive");
-              setLoading(false);
-              return;
-            }
+        const localRecipes = await Store.load("recipes");
+        const localSavedAt = (await Store.load("local-saved-at")) || 0;
+        const localHasData = localRecipes && localRecipes.length > 0 && storedVersion === DATA_VERSION;
+        if (localHasData && !token) {
+          // Local data, no Drive — use local
+          setRecipes(localRecipes.map(migrateRecipe));
+        } else if (localHasData && token) {
+          // Both local and Drive — compare timestamps, use newest
+          const driveData = await DriveSync.restoreAll();
+          const driveSavedAt = driveData?.savedAt || 0;
+          if (driveSavedAt > localSavedAt && driveData?.recipes?.length > 0) {
+            // Drive is newer — restore from Drive
+            await _applyBackup(driveData, DATA_VERSION);
+            notify("✓ Données restaurées depuis Google Drive");
+          } else {
+            // Local is newer or equal — use local, push to Drive
+            setRecipes(localRecipes.map(migrateRecipe));
+            DriveSync.saveAll({
+              recipes: localRecipes
+            }); // silent background push
           }
-          // No Drive data either — use seed
-          const seed = makeSeed();
-          setRecipes(seed);
-          await Store.save("recipes", seed);
-          await Store.save("data-version", DATA_VERSION);
-          await Store.clear("grocery-state");
-          await Store.clear("shopped-cook-ids");
+        } else if (!localHasData && token) {
+          // No local data, try Drive
+          const driveData = await DriveSync.restoreAll();
+          if (driveData?.recipes?.length > 0) {
+            await _applyBackup(driveData, DATA_VERSION);
+            notify("✓ Données restaurées depuis Google Drive");
+          } else {
+            await _useSeed(DATA_VERSION);
+          }
+        } else {
+          // Nothing anywhere — use seed
+          await _useSeed(DATA_VERSION);
         }
       } catch (err) {
         console.error("App init error:", err);
@@ -6788,11 +6797,66 @@ function App() {
       setLoading(false);
     })();
   }, []);
+  const _applyBackup = async (driveData, DATA_VERSION) => {
+    const migrated = (driveData.recipes || []).map(migrateRecipe);
+    setRecipes(migrated);
+    await Store.save("recipes", migrated);
+    await Store.save("data-version", DATA_VERSION);
+    await Store.save("local-saved-at", driveData.savedAt || Date.now());
+    // Restore plan if present
+    if (driveData.plan && driveData.plan.weekKey && driveData.plan.data) {
+      const key = "weekplan-" + driveData.plan.weekKey;
+      await Store.save(key, driveData.plan.data);
+      // If it's the current week, set monday accordingly
+      const driveMonday = new Date(driveData.plan.weekKey);
+      const currentMonday = getMonday(new Date());
+      if (toISO(driveMonday) === toISO(currentMonday)) {
+        setPlan(driveData.plan.data);
+      }
+    }
+    // Restore grocery state
+    if (driveData.shoppedIds) await Store.save("shopped-cook-ids", driveData.shoppedIds);
+    if (driveData.essentials) await Store.save("essentials-memory", driveData.essentials);
+  };
+  const _useSeed = async DATA_VERSION => {
+    const seed = makeSeed();
+    setRecipes(seed);
+    await Store.save("recipes", seed);
+    await Store.save("data-version", DATA_VERSION);
+    await Store.save("local-saved-at", Date.now());
+    await Store.clear("grocery-state");
+    await Store.clear("shopped-cook-ids");
+  };
+
+  // Save everything to Drive — called silently after any significant change
+  const saveFullState = async (overrideRecipes, overridePlan, overrideMonday) => {
+    try {
+      const r = overrideRecipes || recipes;
+      const m = overrideMonday || monday;
+      const weekKey = toISO(m);
+      const p = overridePlan || (await Store.load("weekplan-" + weekKey));
+      const shoppedIds = (await Store.load("shopped-cook-ids")) || [];
+      const essentials = (await Store.load("essentials-memory")) || {};
+      DriveSync.saveAll({
+        recipes: r,
+        plan: p ? {
+          weekKey,
+          data: p
+        } : null,
+        shoppedIds,
+        essentials,
+        savedAt: Date.now()
+      });
+    } catch (e) {
+      console.warn("saveFullState error:", e);
+    }
+  };
   const persist = async up => {
     setRecipes(up);
+    const now = Date.now();
     await Store.save("recipes", up);
-    // Silent Drive backup on every recipe change
-    DriveSync.saveRecipes(up);
+    await Store.save("local-saved-at", now);
+    saveFullState(up, null, null);
   };
 
   // Load plan when monday changes (survives tab switches)
@@ -6852,7 +6916,8 @@ function App() {
     monday: monday,
     setMonday: setMonday,
     recipes: recipes,
-    onGrocery: () => setTab("grocery")
+    onGrocery: () => setTab("grocery"),
+    onDriveSave: saveFullState
   }), tab === "recipes" && rv === "list" && /*#__PURE__*/React.createElement(RecipeList, {
     recipes: recipes,
     onSelect: id => {
@@ -6878,7 +6943,8 @@ function App() {
   }), tab === "grocery" && /*#__PURE__*/React.createElement(GroceryView, {
     plan: plan,
     recipes: recipes,
-    onBack: () => setTab("week")
+    onBack: () => setTab("week"),
+    onDriveSave: saveFullState
   }), /*#__PURE__*/React.createElement(BottomNav, {
     active: tab,
     onChange: t => {
@@ -6910,8 +6976,8 @@ function App() {
         } = await DriveSync.authenticate();
         await DriveSync.saveToken(token, expires);
         setDriveStatus("connected");
-        await DriveSync.saveRecipes(recipes);
-        notify("✓ Google Drive connecté — recettes sauvegardées");
+        await saveFullState(recipes, plan, monday);
+        notify("✓ Google Drive connecté — données sauvegardées");
       } catch (e) {
         notify("Connexion Drive annulée");
       }
@@ -6934,7 +7000,8 @@ function App() {
       color: "#374151",
       cursor: "pointer"
     }
-  }, "\u2601\uFE0F Sauvegarder sur Drive"), driveStatus === "connected" && /*#__PURE__*/React.createElement("div", {
+  }, "\u2601\uFE0F Connecter Drive"), driveStatus === "connected" && /*#__PURE__*/React.createElement("div", {
+    title: "Sauvegarde automatique active",
     style: {
       position: "fixed",
       bottom: 76,
@@ -6949,7 +7016,8 @@ function App() {
       border: "1px solid #86EFAC",
       fontSize: 11,
       fontWeight: 600,
-      color: "#166534"
+      color: "#166534",
+      cursor: "default"
     }
   }, "\u2601\uFE0F Drive \u2713"), /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowDebug(true),
@@ -7071,21 +7139,20 @@ const DriveSync = {
     }
     return null; // File doesn't exist yet
   },
-  // Save recipes to Drive (silent)
-  async saveRecipes(recipes) {
+  // Save all data to Drive (silent)
+  async saveAll(data) {
     try {
       const token = await this.getToken();
-      if (!token) return; // Not authenticated, skip silently
-
+      if (!token) return;
       const content = JSON.stringify({
-        recipes,
-        savedAt: new Date().toISOString(),
-        version: "v1"
+        ...data,
+        savedAt: data.savedAt || Date.now(),
+        version: "v2"
       });
       const fileId = await this.getFileId(token);
+      let res;
       if (fileId) {
-        // Update existing file
-        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+        res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
           method: "PATCH",
           headers: {
             Authorization: "Bearer " + token,
@@ -7094,14 +7161,13 @@ const DriveSync = {
           body: content
         });
       } else {
-        // Create new file in appData
         const meta = JSON.stringify({
           name: BACKUP_FILENAME,
           parents: ["appDataFolder"]
         });
         const boundary = "meal_prep_boundary";
         const body = `--${boundary}\r\nContent-Type: application/json\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${content}\r\n--${boundary}--`;
-        const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+        res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
           method: "POST",
           headers: {
             Authorization: "Bearer " + token,
@@ -7109,18 +7175,23 @@ const DriveSync = {
           },
           body
         });
-        const created = await res.json();
+        const created = await res.clone().json().catch(() => ({}));
         if (created.id) {
           this._fileId = created.id;
           await Store.save("gdrive-file-id", created.id);
         }
       }
+      // If token expired, clear it so UI shows "disconnected"
+      if (res && res.status === 401) {
+        console.warn("Drive token expired, clearing");
+        await this.clearToken();
+      }
     } catch (e) {
-      console.warn("DriveSync.saveRecipes failed silently:", e.message);
+      console.warn("DriveSync.saveAll failed silently:", e.message);
     }
   },
-  // Restore recipes from Drive (on fresh install)
-  async restoreRecipes() {
+  // Restore all data from Drive
+  async restoreAll() {
     try {
       const token = await this.getToken();
       if (!token) return null;
@@ -7132,10 +7203,9 @@ const DriveSync = {
         }
       });
       if (!res.ok) return null;
-      const data = await res.json();
-      return data.recipes || null;
+      return await res.json();
     } catch (e) {
-      console.warn("DriveSync.restoreRecipes failed:", e.message);
+      console.warn("DriveSync.restoreAll failed:", e.message);
       return null;
     }
   },
