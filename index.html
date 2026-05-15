@@ -11,11 +11,7 @@
   <title>Meal Prep</title>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; background: #F4F2EE; }
-    #root { height: 100%; }
-  </style>
+  <style>* { box-sizing: border-box; margin: 0; padding: 0; } html, body { height: 100%; background: #F4F2EE; } #root { height: 100%; }</style>
 </head>
 <body>
   <div id="root"></div>
@@ -6787,8 +6783,15 @@ function App() {
             await _useSeed(DATA_VERSION);
           }
         } else {
-          // Nothing anywhere — use seed
-          await _useSeed(DATA_VERSION);
+          // No local data, no Drive token — show seed but mark as low-priority
+          // so Drive backup wins when user reconnects
+          const seed = makeSeed();
+          setRecipes(seed);
+          await Store.save("recipes", seed);
+          await Store.save("data-version", DATA_VERSION);
+          await Store.save("local-saved-at", 1); // ts=1 means "seed only, Drive is authoritative"
+          await Store.clear("grocery-state");
+          await Store.clear("shopped-cook-ids");
         }
       } catch (err) {
         console.error("App init error:", err);
@@ -6976,9 +6979,24 @@ function App() {
         } = await DriveSync.authenticate();
         await DriveSync.saveToken(token, expires);
         setDriveStatus("connected");
-        await saveFullState(recipes, plan, monday);
-        notify("✓ Google Drive connecté — données sauvegardées");
+
+        // CRITICAL: Check Drive for existing data BEFORE saving anything
+        const driveData = await DriveSync.restoreAll();
+        const localRecipes = await Store.load("recipes");
+        const localSavedAt = (await Store.load("local-saved-at")) || 0;
+        const driveSavedAt = driveData?.savedAt || 0;
+        if (driveData?.recipes?.length > 0 && driveSavedAt > localSavedAt) {
+          // Drive has newer data — restore it
+          const DATA_VERSION = "v7-tags";
+          await _applyBackup(driveData, DATA_VERSION);
+          notify("✓ Données restaurées depuis Google Drive");
+        } else {
+          // Local is newer or Drive is empty — push local to Drive
+          await saveFullState(recipes, plan, monday);
+          notify("✓ Google Drive connecté — données sauvegardées");
+        }
       } catch (e) {
+        console.error("Drive connect error:", e);
         notify("Connexion Drive annulée");
       }
     },
@@ -7213,12 +7231,8 @@ const DriveSync = {
     return !!this._token;
   }
 };
-  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
   </script>
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
-    }
-  </script>
+  <script>if ("serviceWorker" in navigator) { window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js")); }</script>
 </body>
 </html>
